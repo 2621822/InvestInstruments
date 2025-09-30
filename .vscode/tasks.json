@@ -1,0 +1,12 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run AddShareData test and export",
+			"type": "shell",
+			"command": "python GorbunovInvestInstruments/test_add_share.py",
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}

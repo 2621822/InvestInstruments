@@ -1,0 +1,9 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Local databases and secrets
+*.db
+
+# Virtual environments
+.venv/
