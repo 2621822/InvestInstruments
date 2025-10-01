@@ -3,3 +3,5 @@ urllib3
 openpyxl
 aiohttp
 pandas
+pytest
+pytest-asyncio
