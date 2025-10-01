@@ -117,8 +117,53 @@ async def fetch_range(
                     history = data.get("history") or {}
                     columns = history.get("columns")
                     rows = history.get("data") or []
+                    # --- Pagination handling ---
+                    # MOEX ISS provides a cursor dataset 'history.cursor' with columns including TOTAL & PAGESIZE
+                    cursor = data.get("history.cursor") or {}
+                    cursor_cols = cursor.get("columns") or []
+                    cursor_data = cursor.get("data") or []
+                    total_rows_reported = None
+                    page_size = None
+                    if cursor_cols and cursor_data:
+                        # Build mapping from cursor row (assume first row contains meta)
+                        first_row = cursor_data[0]
+                        mapping = {cursor_cols[i]: first_row[i] for i in range(min(len(cursor_cols), len(first_row)))}
+                        # Common field names: TOTAL, PAGESIZE (sometimes uppercase)
+                        total_rows_reported = mapping.get("TOTAL") or mapping.get("total")
+                        page_size = mapping.get("PAGESIZE") or mapping.get("pagesize")
+                    # If total > len(rows), fetch remaining pages sequentially using start=offset
+                    if total_rows_reported and page_size and isinstance(total_rows_reported, int) and isinstance(page_size, int):
+                        fetched = len(rows)
+                        start = fetched
+                        # Safety cap to prevent infinite loop in case of inconsistent cursor
+                        max_expected = total_rows_reported
+                        page_index = 1
+                        while fetched < total_rows_reported and start < max_expected:
+                            page_url = f"{url}&start={start}"
+                            try:
+                                async with session.get(page_url, timeout=HTTP_TIMEOUT) as page_resp:
+                                    if page_resp.status != 200:
+                                        txt = await page_resp.text()
+                                        logging.warning("Page fetch status %s for %s start=%s: %s", page_resp.status, secid, start, txt[:120])
+                                        break
+                                    page_json = await page_resp.json()
+                                    page_history = page_json.get("history") or {}
+                                    page_rows = page_history.get("data") or []
+                                    if not page_rows:
+                                        break
+                                    rows.extend(page_rows)
+                                    fetched += len(page_rows)
+                                    start += len(page_rows)
+                                    page_index += 1
+                                    logging.debug("Pagination page fetched %s (rows cumulative %s/%s) %s", page_index, fetched, total_rows_reported, secid)
+                                    # Guard: if page_rows less than page_size, likely last page
+                                    if len(page_rows) < page_size:
+                                        break
+                            except (aiohttp.ClientError, asyncio.TimeoutError) as page_exc:
+                                logging.warning("Ошибка пагинации %s start=%s: %s", secid, start, page_exc)
+                                break
                     logging.debug(
-                        "Fetched %s rows for %s %s %s-%s", len(rows), secid, board, dr_start, dr_end
+                        "Fetched %s rows for %s %s %s-%s (reported total=%s)", len(rows), secid, board, dr_start, dr_end, total_rows_reported
                     )
                     return rows, columns
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:

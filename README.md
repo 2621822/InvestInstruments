@@ -116,6 +116,7 @@ Features:
 - Bounded concurrency (`--max-concurrency`)
 - Retries with exponential backoff
 - Optional JSON / Excel exports
+- Automatic pagination of ISS history endpoint if result spans multiple pages
 
 ### Basic Run
 
