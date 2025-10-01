@@ -20,6 +20,7 @@ import sqlite3
 import datetime as dt
 import hashlib
 import pathlib
+import time
 from typing import Sequence, Iterable, Any
 
 import aiohttp
@@ -38,6 +39,7 @@ HTTP_RETRIES = int(os.getenv("MOEX_HTTP_RETRIES", "3"))
 HTTP_BACKOFF = float(os.getenv("MOEX_HTTP_BACKOFF", "0.5"))
 RATE_LIMIT_RPS = float(os.getenv("MOEX_RATE_LIMIT", "0"))  # 0 = disabled
 CACHE_DIR_ENV = os.getenv("MOEX_CACHE_DIR")
+SUMMARY_JSON_ENV = os.getenv("MOEX_SUMMARY_JSON")
 class RateLimiter:
     """Simple async token bucket rate limiter.
 
@@ -134,6 +136,7 @@ async def fetch_range(
     semaphore: asyncio.Semaphore,
     rate_limiter: RateLimiter | None,
     cache_dir: pathlib.Path | None,
+    metrics: dict[str, int],
 ) -> tuple[list[list[Any]], list[str] | None]:
     url = (
         "https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/"
@@ -160,11 +163,13 @@ async def fetch_range(
                             rows = history.get("data") or []
                             cursor = data.get("history.cursor") or {}
                             logging.debug("Cache hit %s", url)
+                            metrics["cache_hits"] = metrics.get("cache_hits", 0) + 1
                             # Skip pagination for cached entry (assumed fully cached)
                             return rows, columns
                         except Exception as ce:  # noqa: BLE001
                             logging.warning("Cache read error (%s): %s", cache_file, ce)
                 async with session.get(url, timeout=HTTP_TIMEOUT) as resp:
+                    metrics["http_requests"] = metrics.get("http_requests", 0) + 1
                     if resp.status >= 500:
                         raise aiohttp.ClientResponseError(
                             resp.request_info, resp.history, status=resp.status, message="server error"
@@ -206,6 +211,7 @@ async def fetch_range(
                                 if rate_limiter:
                                     await rate_limiter.acquire()
                                 async with session.get(page_url, timeout=HTTP_TIMEOUT) as page_resp:
+                                    metrics["http_requests"] = metrics.get("http_requests", 0) + 1
                                     if page_resp.status != 200:
                                         txt = await page_resp.text()
                                         logging.warning("Page fetch status %s for %s start=%s: %s", page_resp.status, secid, start, txt[:120])
@@ -226,6 +232,7 @@ async def fetch_range(
                             except (aiohttp.ClientError, asyncio.TimeoutError) as page_exc:
                                 logging.warning("Ошибка пагинации %s start=%s: %s", secid, start, page_exc)
                                 break
+                        metrics["pages_fetched"] = metrics.get("pages_fetched", 0) + max(0, page_index - 1)
                     logging.debug(
                         "Fetched %s rows for %s %s %s-%s (reported total=%s)", len(rows), secid, board, dr_start, dr_end, total_rows_reported
                     )
@@ -246,6 +253,7 @@ async def fetch_range(
                 logging.warning(
                     "Retry %s (%s %s-%s) after error: %s (sleep %.2fs)", attempt, secid, dr_start, dr_end, exc, backoff
                 )
+                metrics["retries"] = metrics.get("retries", 0) + 1
                 await asyncio.sleep(backoff)
     finally:
         semaphore.release()
@@ -261,7 +269,11 @@ async def fetch_security(
 ) -> tuple[list[list[Any]], list[str] | None]:
     # cache_dir passed through args inside wrapper (monkey patch later)
     cache_dir: pathlib.Path | None = getattr(fetch_security, "_cache_dir", None)  # type: ignore[attr-defined]
-    tasks = [fetch_range(session, secid, board, r[0], r[1], semaphore, rate_limiter, cache_dir) for r in ranges]
+    metrics: dict[str, int] = getattr(fetch_security, "_metrics", None)  # type: ignore[attr-defined]
+    tasks = [
+        fetch_range(session, secid, board, r[0], r[1], semaphore, rate_limiter, cache_dir, metrics if metrics is not None else {})
+        for r in ranges
+    ]
     results = await asyncio.gather(*tasks)
     all_rows: list[list[Any]] = []
     columns: list[str] | None = None
@@ -383,6 +395,9 @@ async def async_run(args: argparse.Namespace) -> None:
             logging.info("Файловый кэш (env): %s", cache_dir)
         # attach cache_dir to fetch_security so it propagates
         setattr(fetch_security, "_cache_dir", cache_dir)
+        metrics: dict[str, int] = {"http_requests": 0, "cache_hits": 0, "retries": 0, "pages_fetched": 0}
+        setattr(fetch_security, "_metrics", metrics)
+        run_started = time.perf_counter()
         # Поддержка dry-run: если включен, не открываем БД для записи, только читаем список инструментов из нее (если нужно)
         conn: sqlite3.Connection | None = None
         try:
@@ -468,6 +483,33 @@ async def async_run(args: argparse.Namespace) -> None:
             logging.info("%s: добавлено %s", item["SECID"], item["rows"])
         logging.info("Всего инструментов: %s, всего новых строк: %s", len(summary), total_rows)
 
+        # JSON summary output
+        summary_path = getattr(args, "summary_json", None) or SUMMARY_JSON_ENV
+        if summary_path:
+            duration = time.perf_counter() - run_started
+            payload = {
+                "instruments": summary,
+                "total_instruments": len(summary),
+                "total_rows": total_rows,
+                "http_requests": metrics["http_requests"],
+                "cache_hits": metrics["cache_hits"],
+                "retries": metrics["retries"],
+                "pages_fetched": metrics["pages_fetched"],
+                "duration_sec": round(duration, 3),
+                "dry_run": bool(getattr(args, "dry_run", False)),
+                "rate_limit": getattr(args, "rate_limit", None),
+                "step_days": args.step_days,
+                "since": getattr(args, "since", None),
+                "days": getattr(args, "days", None),
+                "to_date": args.to_date or str(end_date),
+            }
+            try:
+                with open(summary_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+                logging.info("Summary JSON сохранен: %s", summary_path)
+            except Exception as exc:  # noqa: BLE001
+                logging.error("Не удалось сохранить summary JSON (%s): %s", summary_path, exc)
+
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Async MOEX history loader")
@@ -480,6 +522,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="Загрузить и сформировать экспорт без записи в БД")
     p.add_argument("--rate-limit", type=float, help="Ограничить частоту запросов (RPS), 0 или пропуск = без лимита")
     p.add_argument("--cache-dir", help="Каталог файлового кэша ответов ISS (MOEX_CACHE_DIR)")
+    p.add_argument("--summary-json", help="Сохранить сводку (метрики) в JSON файл (или MOEX_SUMMARY_JSON env)")
     p.add_argument("--export", nargs="?", const="moex_data.xlsx", help="Экспорт в Excel (опционально имя файла)")
     p.add_argument("--export-json", nargs="?", const="moex_data.json", help="Экспорт в JSON (опционально имя файла)")
     p.add_argument("--log-level", default="INFO", help="Уровень логирования (DEBUG/INFO/WARNING/...)")
