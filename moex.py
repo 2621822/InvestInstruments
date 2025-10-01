@@ -1,190 +1,309 @@
-# --- Импорт необходимых библиотек ---
-import requests
+"""Async MOEX history loader with incremental updates.
+
+Основные улучшения:
+ - Асинхронные HTTP-запросы (aiohttp) с ограничением параллелизма.
+ - Инкрементальная догрузка: старт от последней даты в БД +1 день либо от START_DATE.
+ - Минимизируется повторное форматирование/парсинг дат.
+ - Логирование вместо print.
+ - Опциональный экспорт в Excel / JSON.
+ - Параметры через CLI (шаг диапазона, максимальная конкуренция, отключение экспорта и т.п.).
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
 import json
-import pandas as pd
-import datetime
+import logging
+import os
 import sqlite3
+import datetime as dt
+from typing import Sequence, Iterable, Any
+
+import aiohttp
+import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-# --- Константы ---
-DB_PATH = 'moex_data.db'
-START_DATE = datetime.date(2022, 1, 1)
-# --- Получение последних дат по каждому инструменту из таблицы moex ---
-def get_last_dates_from_db(conn, instruments):
-    """
-    Возвращает словарь {secid: last_date} для каждого инструмента из таблицы moex.
-    Если данных нет, возвращает None.
-    """
-    last_dates = {}
-    for secid in instruments:
-        # Получаем BOARDID для данного инструмента
-        query_boardid = "SELECT DISTINCT BOARDID FROM moex WHERE SECID = ?"
-        boardids = [row[0] for row in conn.execute(query_boardid, (secid,)).fetchall()]
-        for boardid in boardids:
-            query = "SELECT MAX(TRADEDATE) FROM moex WHERE SECID = ? AND BOARDID = ?"
-            result = conn.execute(query, (secid, boardid)).fetchone()
-            key = (boardid, secid)
-            last_dates[key] = result[0] if result and result[0] else None
-    return last_dates
+# --- Константы / настройки (можно переопределять переменными окружения) ---
+DB_PATH = os.getenv("MOEX_DB_PATH", "moex_data.db")
+START_DATE = dt.date(2022, 1, 1)
+DEFAULT_BOARD = "TQBR"
+DATE_STEP_DAYS = int(os.getenv("MOEX_DATE_STEP", "100"))
+MAX_CONCURRENCY = int(os.getenv("MOEX_MAX_CONCURRENCY", "8"))
+HTTP_TIMEOUT = int(os.getenv("MOEX_HTTP_TIMEOUT", "20"))
+HTTP_RETRIES = int(os.getenv("MOEX_HTTP_RETRIES", "3"))
+HTTP_BACKOFF = float(os.getenv("MOEX_HTTP_BACKOFF", "0.5"))
 
-# --- Импорт необходимых библиотек ---
-import requests
-import json
-import pandas as pd
-import datetime
-import sqlite3
-from openpyxl import load_workbook
-from openpyxl.worksheet.table import Table, TableStyleInfo
 
-def get_date_ranges(start, end, step=100):
-    """
-    Возвращает список кортежей (начало, конец) для диапазонов дат с заданным шагом.
-    """
-    ranges = []
+# --- Логирование ---
+def setup_logging(level: str = "INFO") -> None:
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+# --- Утилиты дат ---
+def get_date_ranges(start: dt.date, end: dt.date, step: int = DATE_STEP_DAYS) -> list[tuple[dt.date, dt.date]]:
+    ranges: list[tuple[dt.date, dt.date]] = []
     current = start
     while current <= end:
-        till = min(current + datetime.timedelta(days=step-1), end)
+        till = min(current + dt.timedelta(days=step - 1), end)
         ranges.append((current, till))
-        current = till + datetime.timedelta(days=1)
+        current = till + dt.timedelta(days=1)
     return ranges
 
-def load_instruments(conn, needed):
-    """
-    Загружает справочник инструментов из таблицы share и фильтрует по списку needed.
-    """
-    share_df = pd.read_sql('SELECT * FROM share', conn)
-    return share_df[share_df['share'].isin(needed)]['share'].dropna().unique()
 
-def fetch_moex_data(instruments, date_ranges):
-    """
-    Загружает исторические данные по каждому инструменту за указанные диапазоны дат.
-    Возвращает список строк и список столбцов.
-    """
-    all_rows = []
-    columns = None
-    for secid in instruments:
-        print(f"Обрабатывается инструмент: {secid}")
-        has_data = False
-        instrument_rows = 0
-        for dr_start, dr_end in date_ranges:
-            url = f"https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/TQBR/securities/{secid}.json?from={dr_start}&till={dr_end}"
-            response = requests.get(url)
-            if response.status_code == 200:
-                data = response.json()
-                if columns is None:
-                    columns = data["history"]["columns"]
-                rows = data["history"]["data"]
-                row_count = len(rows) if rows else 0
-                print(f"  Диапазон дат: {dr_start} — {dr_end}: получено строк: {row_count}")
-                if rows:
-                    has_data = True
-                    all_rows.extend(rows)
-                    instrument_rows += row_count
-            else:
-                print(f"  Диапазон дат: {dr_start} — {dr_end}: ошибка {response.status_code} для {secid}: {response.text}")
-        print(f"  Получено строк: {instrument_rows}")
-        if not has_data:
-            print(f"Нет данных по инструменту: {secid}")
+# --- Работа с БД ---
+def get_last_dates(conn: sqlite3.Connection, secids: Iterable[str]) -> dict[tuple[str, str], str | None]:
+    """Вернуть {(boardid, secid): max_trade_date or None}."""
+    result: dict[tuple[str, str], str | None] = {}
+    for secid in secids:
+        rows = conn.execute("SELECT DISTINCT BOARDID FROM moex WHERE SECID=?", (secid,)).fetchall()
+        boardids = [r[0] for r in rows] or [DEFAULT_BOARD]
+        for board in boardids:
+            max_date = conn.execute(
+                "SELECT MAX(TRADEDATE) FROM moex WHERE SECID=? AND BOARDID=?",
+                (secid, board),
+            ).fetchone()[0]
+            result[(board, secid)] = max_date
+    return result
+
+
+def read_instruments(conn: sqlite3.Connection, only: list[str] | None = None) -> list[str]:
+    df = pd.read_sql("SELECT * FROM share", conn)
+    if "share" not in df.columns:
+        raise RuntimeError("В таблице share отсутствует колонка 'share'")
+    series = df["share"].dropna().astype(str).unique().tolist()
+    if only:
+        filt = {s.upper() for s in only}
+        series = [s for s in series if s.upper() in filt]
+    return series
+
+
+# --- Асинхронный HTTP слой ---
+async def fetch_range(
+    session: aiohttp.ClientSession,
+    secid: str,
+    board: str,
+    dr_start: dt.date,
+    dr_end: dt.date,
+    semaphore: asyncio.Semaphore,
+) -> tuple[list[list[Any]], list[str] | None]:
+    url = (
+        "https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/"
+        f"{board}/securities/{secid}.json?from={dr_start}&till={dr_end}"
+    )
+    attempt = 0
+    await semaphore.acquire()
+    try:
+        while True:
+            attempt += 1
+            try:
+                async with session.get(url, timeout=HTTP_TIMEOUT) as resp:
+                    if resp.status >= 500:
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info, resp.history, status=resp.status, message="server error"
+                        )
+                    if resp.status != 200:
+                        text = await resp.text()
+                        logging.warning(
+                            "HTTP %s (%s %s) %s", resp.status, secid, f"{dr_start}:{dr_end}", text[:200]
+                        )
+                        return [], None
+                    data = await resp.json()
+                    history = data.get("history") or {}
+                    columns = history.get("columns")
+                    rows = history.get("data") or []
+                    logging.debug(
+                        "Fetched %s rows for %s %s %s-%s", len(rows), secid, board, dr_start, dr_end
+                    )
+                    return rows, columns
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt >= HTTP_RETRIES:
+                    logging.error("Fail %s after %s attempts: %s", secid, attempt, exc)
+                    return [], None
+                backoff = HTTP_BACKOFF * (2 ** (attempt - 1))
+                logging.warning(
+                    "Retry %s (%s %s-%s) after error: %s (sleep %.2fs)", attempt, secid, dr_start, dr_end, exc, backoff
+                )
+                await asyncio.sleep(backoff)
+    finally:
+        semaphore.release()
+
+
+async def fetch_security(
+    session: aiohttp.ClientSession,
+    secid: str,
+    board: str,
+    ranges: Sequence[tuple[dt.date, dt.date]],
+    semaphore: asyncio.Semaphore,
+) -> tuple[list[list[Any]], list[str] | None]:
+    tasks = [fetch_range(session, secid, board, r[0], r[1], semaphore) for r in ranges]
+    results = await asyncio.gather(*tasks)
+    all_rows: list[list[Any]] = []
+    columns: list[str] | None = None
+    for rows, cols in results:
+        if rows:
+            all_rows.extend(rows)
+        if cols and not columns:
+            columns = cols
     return all_rows, columns
 
-def save_json(data, path):
-    """
-    Сохраняет данные в JSON-файл.
-    """
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-    print(f"Данные успешно записаны в файл '{path}'")
 
-def format_dates(df, columns):
-    """
-    Форматирует столбцы дат в российский формат (дд.мм.гггг).
-    """
-    for date_col in columns:
-        if date_col in df.columns:
-            df[date_col] = pd.to_datetime(df[date_col], errors='coerce').dt.strftime('%d.%m.%Y')
+def normalize_dates(df: pd.DataFrame, date_cols: Iterable[str]) -> pd.DataFrame:
+    for c in date_cols:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
     return df
 
-def save_excel(df, path):
-    """
-    Сохраняет DataFrame в Excel и преобразует лист в умную таблицу.
-    """
+
+def format_ru_dates(df: pd.DataFrame, date_cols: Iterable[str]) -> pd.DataFrame:
+    for c in date_cols:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce").dt.strftime("%d.%m.%Y")
+    return df
+
+
+def save_json(data: list[dict[str, Any]], path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    logging.info("JSON сохранен: %s", path)
+
+
+def save_excel(df: pd.DataFrame, path: str) -> None:
     df.to_excel(path, index=False)
     wb = load_workbook(path)
     ws = wb.active
     tab = Table(displayName="MOEXTable", ref=ws.dimensions)
-    style = TableStyleInfo(name="TableStyleMedium9", showFirstColumn=False,
-                           showLastColumn=False, showRowStripes=True, showColumnStripes=True)
+    style = TableStyleInfo(
+        name="TableStyleMedium9", showFirstColumn=False, showLastColumn=False, showRowStripes=True, showColumnStripes=True
+    )
     tab.tableStyleInfo = style
     ws.add_table(tab)
     wb.save(path)
-    print(f"Данные сохранены в умной таблице Excel: '{path}'")
+    logging.info("Excel сохранен: %s", path)
 
-def save_sqlite(df, conn, table_name):
-    """
-    Сохраняет DataFrame в таблицу SQLite.
-    """
-    df.to_sql(table_name, conn, if_exists='replace', index=False)
-    print(f"Данные сохранены в базе данных moex_data.db, таблица '{table_name}'")
 
-# --- Основной алгоритм ---
-def main():
-    end_date = datetime.date.today()
-    try:
+def append_to_sqlite(conn: sqlite3.Connection, df: pd.DataFrame) -> int:
+    before = conn.execute("SELECT COUNT(*) FROM moex").fetchone()[0] if table_exists(conn, "moex") else 0
+    df.to_sql("moex", conn, if_exists="append", index=False)
+    after = conn.execute("SELECT COUNT(*) FROM moex").fetchone()[0]
+    return after - before
+
+
+def table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    cur = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (name,),
+    )
+    return cur.fetchone() is not None
+
+
+async def async_run(args: argparse.Namespace) -> None:
+    setup_logging(args.log_level)
+    end_date = dt.date.today() if args.to_date is None else dt.datetime.strptime(args.to_date, "%Y-%m-%d").date()
+    async with aiohttp.ClientSession(headers={"User-Agent": "moex-loader/1.0"}) as session:
+        semaphore = asyncio.Semaphore(args.max_concurrency)
         with sqlite3.connect(DB_PATH) as conn:
-            share_df = pd.read_sql('SELECT * FROM share', conn)
-            instruments = share_df['share'].dropna().unique()
-            boardid_map = {}
-            last_dates = get_last_dates_from_db(conn, instruments)
-            summary = []
-            all_data = []
-            columns = None
+            instruments = read_instruments(conn, args.instruments)
+            if not instruments:
+                logging.warning("Нет инструментов для загрузки.")
+                return
+            if not table_exists(conn, "moex"):
+                logging.info("Таблица moex отсутствует — будет создана при первой вставке.")
+            last_dates = get_last_dates(conn, instruments)
+            all_export_rows: list[dict[str, Any]] = []
+            export_columns: list[str] | None = None
+            summary: list[dict[str, Any]] = []
+
             for secid in instruments:
-                query_boardid = "SELECT DISTINCT BOARDID FROM moex WHERE SECID = ?"
-                boardids = [row[0] for row in conn.execute(query_boardid, (secid,)).fetchall()]
-                boardids = boardids if boardids else ['TQBR']
-                total_rows = 0
-                for boardid in boardids:
-                    last_date = last_dates.get((boardid, secid))
-                    if last_date:
-                        try:
-                            start_date = datetime.datetime.strptime(last_date, '%Y-%m-%d').date() + datetime.timedelta(days=1)
-                        except ValueError:
-                            start_date = datetime.datetime.strptime(last_date, '%d.%m.%Y').date() + datetime.timedelta(days=1)
+                # Для каждого board (если нет данных — используем DEFAULT_BOARD)
+                boards = {b for (b, s) in last_dates.keys() if s == secid} or {DEFAULT_BOARD}
+                total_rows_sec = 0
+                for board in boards:
+                    last_date_raw = last_dates.get((board, secid))
+                    if last_date_raw:
+                        # Пытаемся разные форматы
+                        parsed = None
+                        for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+                            try:
+                                parsed = dt.datetime.strptime(last_date_raw, fmt).date()
+                                break
+                            except ValueError:
+                                pass
+                        start_date = (parsed or START_DATE) + dt.timedelta(days=1)
                     else:
                         start_date = START_DATE
-                    date_ranges = get_date_ranges(start_date, end_date)
-                    sec_rows, sec_columns = fetch_moex_data([secid], date_ranges)
-                    sec_rows = [row for row in sec_rows if (len(row) > 0 and (row[0] == boardid))]
-                    if sec_columns and columns is None:
-                        columns = sec_columns
-                    if sec_rows:
-                        df = pd.DataFrame(sec_rows, columns=columns)
-                        # Удаляем дубли по ключу
-                        if set(['BOARDID', 'TRADEDATE', 'SECID']).issubset(df.columns):
-                            df = df.drop_duplicates(subset=['BOARDID', 'TRADEDATE', 'SECID'])
-                        # Сохраняем в базу
-                        df.to_sql('moex', conn, if_exists='append', index=False)
-                        # Форматируем даты
-                        df = format_dates(df, ['TRADEDATE', 'TRADE_SESSION_DATE'])
-                        # Добавляем к общим данным
-                        all_data.extend(df.to_dict(orient='records'))
-                        added_rows = len(df)
-                        total_rows += added_rows
-                summary.append({'SECID': secid, 'rows': total_rows})
-            # Сохраняем общий DataFrame и JSON только один раз
-            if all_data and columns:
-                all_data_df = pd.DataFrame(all_data, columns=columns)
-                save_excel(all_data_df, 'moex_data.xlsx')
-                save_json(all_data, 'moex_data.json')
-            print("\nИтоговая сводка:")
-            for item in summary:
-                print(f"Инструмент: {item['SECID']}, добавлено строк: {item['rows']}")
-            print(f"Всего обработано инструментов: {len(summary)}")
-            print(f"Общее количество добавленных строк: {sum(item['rows'] for item in summary)}")
-    except Exception as e:
-        print(f"Ошибка выполнения: {e}")
+                    if start_date > end_date:
+                        logging.info("%s %s: нет новых дат (start>%s)", secid, board, end_date)
+                        continue
+                    ranges = get_date_ranges(start_date, end_date, args.step_days)
+                    logging.info("%s %s: диапазонов %s (с %s по %s)", secid, board, len(ranges), start_date, end_date)
+                    rows, cols = await fetch_security(session, secid, board, ranges, semaphore)
+                    if not rows:
+                        logging.info("%s %s: новых строк нет", secid, board)
+                        continue
+                    if cols and not export_columns:
+                        export_columns = cols
+                    # Фильтрация по board (первая колонка должна быть BOARDID)
+                    rows = [r for r in rows if r and r[0] == board]
+                    if not rows:
+                        continue
+                    df = pd.DataFrame(rows, columns=export_columns)
+                    # Удаляем дубли до вставки
+                    if {"BOARDID", "TRADEDATE", "SECID"}.issubset(df.columns):
+                        df.drop_duplicates(subset=["BOARDID", "TRADEDATE", "SECID"], inplace=True)
+                    inserted = append_to_sqlite(conn, df)
+                    logging.info("%s %s: добавлено %s строк", secid, board, inserted)
+                    total_rows_sec += inserted
+                    if args.export or args.export_json:
+                        # Для экспорта преобразуем даты копией
+                        df_export = df.copy()
+                        df_export = format_ru_dates(df_export, ["TRADEDATE", "TRADE_SESSION_DATE"])
+                        all_export_rows.extend(df_export.to_dict(orient="records"))
+                summary.append({"SECID": secid, "rows": total_rows_sec})
 
-if __name__ == "__main__":
+        # Экспорт вне контекста соединения
+        if (args.export or args.export_json) and all_export_rows and export_columns:
+            export_df = pd.DataFrame(all_export_rows, columns=export_columns)
+            if args.export:
+                save_excel(export_df, args.export)
+            if args.export_json:
+                save_json(all_export_rows, args.export_json)
+
+        # Итоговая сводка
+        total_rows = sum(item["rows"] for item in summary)
+        logging.info("==== СВОДКА ====")
+        for item in summary:
+            logging.info("%s: добавлено %s", item["SECID"], item["rows"])
+        logging.info("Всего инструментов: %s, всего новых строк: %s", len(summary), total_rows)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Async MOEX history loader")
+    p.add_argument("--instruments", nargs="*", help="Список SECID для ограничения выборки (опционально)")
+    p.add_argument("--to-date", help="Дата окончания (YYYY-MM-DD), по умолчанию сегодня", dest="to_date")
+    p.add_argument("--step-days", type=int, default=DATE_STEP_DAYS, help="Размер диапазона дат в днях (батч)")
+    p.add_argument("--max-concurrency", type=int, default=MAX_CONCURRENCY, dest="max_concurrency", help="Максимум одновременных запросов")
+    p.add_argument("--export", nargs="?", const="moex_data.xlsx", help="Экспорт в Excel (опционально имя файла)")
+    p.add_argument("--export-json", nargs="?", const="moex_data.json", help="Экспорт в JSON (опционально имя файла)")
+    p.add_argument("--log-level", default="INFO", help="Уровень логирования (DEBUG/INFO/WARNING/...)")
+    return p
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
+    try:
+        asyncio.run(async_run(args))
+    except KeyboardInterrupt:
+        logging.warning("Прервано пользователем")
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Необработанная ошибка: %s", exc)
+
+
+if __name__ == "__main__":  # pragma: no cover
     main()
 
