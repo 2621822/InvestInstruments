@@ -142,6 +142,7 @@ python moex.py --instruments SBER GAZP LKOH
 | `--max-concurrency N` | Parallel fetch limit (env `MOEX_MAX_CONCURRENCY`, default 8). |
 | `--export [FILE]` | Export combined fetched data to Excel (default `moex_data.xlsx`). |
 | `--export-json [FILE]` | Export fetched data to JSON (default `moex_data.json`). |
+| `--dry-run` | Fetch & build export only, do not write to DB. |
 | `--log-level LEVEL` | Logging level. |
 
 ### Environment Variables (MOEX)

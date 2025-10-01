@@ -292,20 +292,38 @@ async def async_run(args: argparse.Namespace) -> None:
     args._effective_end_date = end_date  # type: ignore[attr-defined]
     async with aiohttp.ClientSession(headers={"User-Agent": "moex-loader/1.0"}) as session:
         semaphore = asyncio.Semaphore(args.max_concurrency)
-        with sqlite3.connect(DB_PATH) as conn:
-            instruments = read_instruments(conn, args.instruments)
+        # Поддержка dry-run: если включен, не открываем БД для записи, только читаем список инструментов из нее (если нужно)
+        conn: sqlite3.Connection | None = None
+        try:
+            if args.dry_run:
+                # В dry-run читаем список инструментов и last_dates (если есть БД), но не вставляем данные
+                if os.path.exists(DB_PATH):
+                    conn = sqlite3.connect(DB_PATH)
+                    instruments = read_instruments(conn, args.instruments)
+                    last_dates = get_last_dates(conn, instruments) if instruments else {}
+                else:
+                    logging.warning("БД %s не найдена — dry-run будет выполнен только для списка инструментов из аргументов", DB_PATH)
+                    instruments = args.instruments or []
+                    last_dates = {}
+            else:
+                conn = sqlite3.connect(DB_PATH)
+                instruments = read_instruments(conn, args.instruments)
+                if not instruments:
+                    logging.warning("Нет инструментов для загрузки.")
+                    return
+                if not table_exists(conn, "moex"):
+                    logging.info("Таблица moex отсутствует — будет создана при первой вставке.")
+                last_dates = get_last_dates(conn, instruments)
+
             if not instruments:
-                logging.warning("Нет инструментов для загрузки.")
+                logging.warning("Список инструментов пуст.")
                 return
-            if not table_exists(conn, "moex"):
-                logging.info("Таблица moex отсутствует — будет создана при первой вставке.")
-            last_dates = get_last_dates(conn, instruments)
+
             all_export_rows: list[dict[str, Any]] = []
             export_columns: list[str] | None = None
             summary: list[dict[str, Any]] = []
 
             for secid in instruments:
-                # Для каждого board (если нет данных — используем DEFAULT_BOARD)
                 boards = {b for (b, s) in last_dates.keys() if s == secid} or {DEFAULT_BOARD}
                 total_rows_sec = 0
                 for board in boards:
@@ -315,30 +333,34 @@ async def async_run(args: argparse.Namespace) -> None:
                         logging.info("%s %s: нет новых дат (start>%s)", secid, board, end_date)
                         continue
                     ranges = get_date_ranges(start_date, end_date, args.step_days)
-                    logging.info("%s %s: диапазонов %s (с %s по %s)", secid, board, len(ranges), start_date, end_date)
+                    logging.info("%s %s: диапазонов %s (с %s по %s)%s", secid, board, len(ranges), start_date, end_date, " [dry-run]" if args.dry_run else "")
                     rows, cols = await fetch_security(session, secid, board, ranges, semaphore)
                     if not rows:
                         logging.info("%s %s: новых строк нет", secid, board)
                         continue
                     if cols and not export_columns:
                         export_columns = cols
-                    # Фильтрация по board (первая колонка должна быть BOARDID)
                     rows = [r for r in rows if r and r[0] == board]
                     if not rows:
                         continue
                     df = pd.DataFrame(rows, columns=export_columns)
-                    # Удаляем дубли до вставки
                     if {"BOARDID", "TRADEDATE", "SECID"}.issubset(df.columns):
                         df.drop_duplicates(subset=["BOARDID", "TRADEDATE", "SECID"], inplace=True)
-                    inserted = append_to_sqlite(conn, df)
-                    logging.info("%s %s: добавлено %s строк", secid, board, inserted)
+                    if args.dry_run:
+                        inserted = len(df)
+                        logging.info("%s %s: (dry-run) потенциально добавлено %s строк", secid, board, inserted)
+                    else:
+                        inserted = append_to_sqlite(conn, df) if conn else 0
+                        logging.info("%s %s: добавлено %s строк", secid, board, inserted)
                     total_rows_sec += inserted
                     if args.export or args.export_json:
-                        # Для экспорта преобразуем даты копией
                         df_export = df.copy()
                         df_export = format_ru_dates(df_export, ["TRADEDATE", "TRADE_SESSION_DATE"])
                         all_export_rows.extend(df_export.to_dict(orient="records"))
                 summary.append({"SECID": secid, "rows": total_rows_sec})
+        finally:
+            if conn:
+                conn.close()
 
         # Экспорт вне контекста соединения
         if (args.export or args.export_json) and all_export_rows and export_columns:
@@ -364,6 +386,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-concurrency", type=int, default=MAX_CONCURRENCY, dest="max_concurrency", help="Максимум одновременных запросов")
     p.add_argument("--since", help="Принудительная дата начала (YYYY-MM-DD), перекрывает инкремент и --days")
     p.add_argument("--days", type=int, help="Ограничить диапазон последними N днями (игнорируется если задан --since)")
+    p.add_argument("--dry-run", action="store_true", help="Загрузить и сформировать экспорт без записи в БД")
     p.add_argument("--export", nargs="?", const="moex_data.xlsx", help="Экспорт в Excel (опционально имя файла)")
     p.add_argument("--export-json", nargs="?", const="moex_data.json", help="Экспорт в JSON (опционально имя файла)")
     p.add_argument("--log-level", default="INFO", help="Уровень логирования (DEBUG/INFO/WARNING/...)")
