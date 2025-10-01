@@ -45,9 +45,9 @@ if not SESSION.verify:
 API_TIMEOUT = int(os.getenv("API_TIMEOUT", "15"))
 API_MAX_ATTEMPTS = int(os.getenv("API_MAX_ATTEMPTS", "3"))
 API_BACKOFF_BASE = float(os.getenv("API_BACKOFF_BASE", "0.5"))  # сек
-MAX_CONSENSUS_PER_UID = 300
-MAX_TARGETS_PER_ANALYST = 100
-MAX_HISTORY_DAYS = 1000  # возраст записей (дней), старше которого данные удаляются дополнительно
+MAX_CONSENSUS_PER_UID = int(os.getenv("CONSENSUS_MAX_PER_UID", "300"))
+MAX_TARGETS_PER_ANALYST = int(os.getenv("CONSENSUS_MAX_TARGETS_PER_ANALYST", "100"))
+MAX_HISTORY_DAYS = int(os.getenv("CONSENSUS_MAX_HISTORY_DAYS", "1000"))  # возраст записей (дней), старше которого данные удаляются (0/<=0 отключает)
 
 def setup_logging() -> None:
 	"""Configure logging with both console and rotating file handler (idempotent)."""
@@ -667,8 +667,22 @@ def AddConsensusTargets(db_path: Path, targets: list[dict]) -> None:
 	)
 
 
-def UpdateConsensusForecasts(db_path: Path, token: str, *, uid: str | None = None) -> None:
-	"""Fetch and store consensus data for a specific instrument or all instruments."""
+def UpdateConsensusForecasts(
+	db_path: Path,
+	token: str,
+	*,
+	uid: str | None = None,
+	max_consensus: int | None = None,
+	max_targets_per_analyst: int | None = None,
+	max_history_days: int | None = None,
+) -> None:
+	"""Fetch and store consensus data then prune according to provided limits.
+
+	Parameters override precedence:
+	1. Explicit function arguments (from CLI)
+	2. Environment variables (CONSENSUS_MAX_PER_UID / CONSENSUS_MAX_TARGETS_PER_ANALYST / CONSENSUS_MAX_HISTORY_DAYS)
+	3. Hard-coded defaults in absence of env (already baked into module-level constants)
+	"""
 
 	with sqlite3.connect(db_path) as conn:
 		cursor = conn.cursor()
@@ -687,8 +701,14 @@ def UpdateConsensusForecasts(db_path: Path, token: str, *, uid: str | None = Non
 		AddConsensusForecasts(db_path, consensus)
 		AddConsensusTargets(db_path, targets)
 
+	eff_max_consensus = max_consensus if max_consensus is not None else MAX_CONSENSUS_PER_UID
+	eff_max_targets = max_targets_per_analyst if max_targets_per_analyst is not None else MAX_TARGETS_PER_ANALYST
+	eff_max_age = max_history_days if max_history_days is not None else MAX_HISTORY_DAYS
+	# age pruning disabled if non-positive
+	if eff_max_age is not None and eff_max_age <= 0:
+		eff_max_age = None
 	# После загрузки — очистка лишней истории
-	PruneHistory(db_path, MAX_CONSENSUS_PER_UID, MAX_TARGETS_PER_ANALYST)
+	PruneHistory(db_path, eff_max_consensus, eff_max_targets, max_age_days=eff_max_age)
 
 
 def FillingConsensusData(db_path: Path, token: str, *, limit: int | None = None, sleep_sec: float = 0.0) -> None:
@@ -906,6 +926,24 @@ def parse_args() -> argparse.Namespace:
 		metavar="SEC",
 		help="пауза (секунды) между запросами при --fill-consensus для снижения нагрузки",
 	)
+	parser.add_argument(
+		"--max-consensus",
+		type=int,
+		metavar="N",
+		help="лимит записей consensus_forecasts на один uid (override CONSENSUS_MAX_PER_UID)",
+	)
+	parser.add_argument(
+		"--max-targets-per-analyst",
+		type=int,
+		metavar="N",
+		help="лимит записей consensus_targets на пару (uid, company) (override CONSENSUS_MAX_TARGETS_PER_ANALYST)",
+	)
+	parser.add_argument(
+		"--max-history-days",
+		type=int,
+		metavar="DAYS",
+		help="удалять записи старше N дней (override CONSENSUS_MAX_HISTORY_DAYS, 0 или отрицательное — отключить возрастное удаление)",
+	)
 	return parser.parse_args()
 
 
@@ -933,7 +971,14 @@ def main() -> None:
 
 	if args.update_consensus:
 		uid = None if args.update_consensus == "ALL" else args.update_consensus
-		UpdateConsensusForecasts(DB_PATH, TOKEN, uid=uid)
+		UpdateConsensusForecasts(
+			DB_PATH,
+			TOKEN,
+			uid=uid,
+			max_consensus=getattr(args, "max_consensus", None),
+			max_targets_per_analyst=getattr(args, "max_targets_per_analyst", None),
+			max_history_days=getattr(args, "max_history_days", None),
+		)
 
 	if args.fill_consensus:
 		FillingConsensusData(

@@ -40,6 +40,9 @@ Available options:
 | `--fill-consensus` | One-time (or ad‑hoc) bulk initial load of consensus + analyst targets for all shares (no pruning). |
 | `--fill-consensus-limit N` | Limit number of instruments processed during `--fill-consensus` (useful for testing). |
 | `--fill-consensus-sleep SEC` | Add delay (seconds, can be fractional) between API calls during `--fill-consensus`. |
+| `--max-consensus N` | Override max stored consensus rows per instrument (default / env). |
+| `--max-targets-per-analyst N` | Override max analyst target rows per (uid, company). |
+| `--max-history-days DAYS` | Override age pruning threshold in days (0 disables age pruning). |
 
 Examples:
 
@@ -102,6 +105,9 @@ You can override the API token by setting environment variable `TINKOFF_INVEST_T
 | `APP_LOG_LEVEL` | Logging level (INFO/DEBUG/...) | INFO |
 | `APP_LOG_FILE` | Log file name for rotating logs | app.log |
 | `APP_DISABLE_SSL_VERIFY` | Set to 1 to disable TLS verification (dev only) | 0 |
+| `CONSENSUS_MAX_PER_UID` | Max consensus rows per uid (CLI override: --max-consensus) | 300 |
+| `CONSENSUS_MAX_TARGETS_PER_ANALYST` | Max target rows per (uid, company) (CLI override) | 100 |
+| `CONSENSUS_MAX_HISTORY_DAYS` | Age pruning threshold days (CLI override: --max-history-days) | 1000 |
 
 ---
 
