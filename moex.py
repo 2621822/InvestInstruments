@@ -202,9 +202,49 @@ def table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return cur.fetchone() is not None
 
 
+def resolve_start_date(base_start: dt.date, args: argparse.Namespace, last_date_raw: str | None) -> dt.date:
+    """Determine the effective start date for a security considering overrides.
+
+    Precedence (highest wins):
+    1. --since YYYY-MM-DD (explicit absolute date)
+    2. --days N (start = end_date - N + 1)
+    3. Incremental (last_date + 1)
+    4. Global START_DATE constant
+    """
+    # If user forced absolute since
+    if getattr(args, "since", None):
+        try:
+            return dt.datetime.strptime(args.since, "%Y-%m-%d").date()
+        except ValueError:
+            logging.error("Некорректный формат --since: %s (ожидается YYYY-MM-DD)", args.since)
+    # days relative window
+    if getattr(args, "days", None) is not None:
+        try:
+            window_days = int(args.days)
+            if window_days > 0:
+                return args._effective_end_date - dt.timedelta(days=window_days - 1)
+        except (TypeError, ValueError):
+            logging.error("Некорректное значение --days: %s", args.days)
+    # incremental from last_date_raw
+    if last_date_raw:
+        parsed = None
+        for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+            try:
+                parsed = dt.datetime.strptime(last_date_raw, fmt).date()
+                break
+            except ValueError:
+                pass
+        if parsed:
+            return parsed + dt.timedelta(days=1)
+    # fallback
+    return base_start
+
+
 async def async_run(args: argparse.Namespace) -> None:
     setup_logging(args.log_level)
     end_date = dt.date.today() if args.to_date is None else dt.datetime.strptime(args.to_date, "%Y-%m-%d").date()
+    # сохранить для расчёта --days
+    args._effective_end_date = end_date  # type: ignore[attr-defined]
     async with aiohttp.ClientSession(headers={"User-Agent": "moex-loader/1.0"}) as session:
         semaphore = asyncio.Semaphore(args.max_concurrency)
         with sqlite3.connect(DB_PATH) as conn:
@@ -225,18 +265,7 @@ async def async_run(args: argparse.Namespace) -> None:
                 total_rows_sec = 0
                 for board in boards:
                     last_date_raw = last_dates.get((board, secid))
-                    if last_date_raw:
-                        # Пытаемся разные форматы
-                        parsed = None
-                        for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
-                            try:
-                                parsed = dt.datetime.strptime(last_date_raw, fmt).date()
-                                break
-                            except ValueError:
-                                pass
-                        start_date = (parsed or START_DATE) + dt.timedelta(days=1)
-                    else:
-                        start_date = START_DATE
+                    start_date = resolve_start_date(START_DATE, args, last_date_raw)
                     if start_date > end_date:
                         logging.info("%s %s: нет новых дат (start>%s)", secid, board, end_date)
                         continue
@@ -288,6 +317,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--to-date", help="Дата окончания (YYYY-MM-DD), по умолчанию сегодня", dest="to_date")
     p.add_argument("--step-days", type=int, default=DATE_STEP_DAYS, help="Размер диапазона дат в днях (батч)")
     p.add_argument("--max-concurrency", type=int, default=MAX_CONCURRENCY, dest="max_concurrency", help="Максимум одновременных запросов")
+    p.add_argument("--since", help="Принудительная дата начала (YYYY-MM-DD), перекрывает инкремент и --days")
+    p.add_argument("--days", type=int, help="Ограничить диапазон последними N днями (игнорируется если задан --since)")
     p.add_argument("--export", nargs="?", const="moex_data.xlsx", help="Экспорт в Excel (опционально имя файла)")
     p.add_argument("--export-json", nargs="?", const="moex_data.json", help="Экспорт в JSON (опционально имя файла)")
     p.add_argument("--log-level", default="INFO", help="Уровень логирования (DEBUG/INFO/WARNING/...)")

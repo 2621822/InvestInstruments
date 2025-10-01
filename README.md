@@ -19,7 +19,7 @@ or, if you prefer not to use a requirements file:
 pip install requests urllib3 openpyxl
 ```
 
-## Usage
+## Usage (Tinkoff + Consensus)
 
 All commands are executed from the project root with PowerShell:
 
@@ -102,6 +102,67 @@ You can override the API token by setting environment variable `TINKOFF_INVEST_T
 | `APP_LOG_LEVEL` | Logging level (INFO/DEBUG/...) | INFO |
 | `APP_LOG_FILE` | Log file name for rotating logs | app.log |
 | `APP_DISABLE_SSL_VERIFY` | Set to 1 to disable TLS verification (dev only) | 0 |
+
+---
+
+## Async MOEX History Loader
+
+File: `moex.py` — асинхронная утилита загрузки исторических данных с ISS MOEX.
+
+Features:
+- Incremental updates: starts from last stored TRADEDATE+1 per (BOARDID, SECID)
+- Override start date with `--since` or sliding window with `--days`
+- Batching by date ranges (`--step-days`)
+- Bounded concurrency (`--max-concurrency`)
+- Retries with exponential backoff
+- Optional JSON / Excel exports
+
+### Basic Run
+
+```
+python moex.py --instruments SBER GAZP LKOH
+```
+
+### Options
+
+| Option | Description |
+| --- | --- |
+| `--instruments SECID...` | Limit to specific SECIDs (otherwise all from `share` table in `moex_data.db`). |
+| `--to-date YYYY-MM-DD` | Upper bound date (default = today). |
+| `--since YYYY-MM-DD` | Force absolute start date (highest precedence). |
+| `--days N` | Load only last N days (ignored if `--since` provided). |
+| `--step-days N` | Date batch size (default from env `MOEX_DATE_STEP`, default 100). |
+| `--max-concurrency N` | Parallel fetch limit (env `MOEX_MAX_CONCURRENCY`, default 8). |
+| `--export [FILE]` | Export combined fetched data to Excel (default `moex_data.xlsx`). |
+| `--export-json [FILE]` | Export fetched data to JSON (default `moex_data.json`). |
+| `--log-level LEVEL` | Logging level. |
+
+### Environment Variables (MOEX)
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `MOEX_DB_PATH` | SQLite path for MOEX data | `moex_data.db` |
+| `MOEX_DATE_STEP` | Default batch size (days) | 100 |
+| `MOEX_MAX_CONCURRENCY` | Max simultaneous HTTP requests | 8 |
+| `MOEX_HTTP_TIMEOUT` | Per-request timeout seconds | 20 |
+| `MOEX_HTTP_RETRIES` | Retry attempts | 3 |
+| `MOEX_HTTP_BACKOFF` | Base seconds for exp. backoff | 0.5 |
+
+### Example: Last 30 Days Only
+
+```
+python moex.py --instruments SBER GAZP --days 30
+```
+
+### Example: Force Fresh Load From Fixed Date
+
+```
+python moex.py --instruments SBER --since 2024-01-01 --export-json sber_2024.json
+```
+
+Precedence of start date: --since > --days > incremental-from-last > default(2022-01-01)
+
+---
 
 Disabling SSL verification (`APP_DISABLE_SSL_VERIFY=1`) is strongly discouraged outside of local debugging.
 
