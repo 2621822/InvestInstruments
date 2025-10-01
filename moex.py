@@ -34,6 +34,44 @@ MAX_CONCURRENCY = int(os.getenv("MOEX_MAX_CONCURRENCY", "8"))
 HTTP_TIMEOUT = int(os.getenv("MOEX_HTTP_TIMEOUT", "20"))
 HTTP_RETRIES = int(os.getenv("MOEX_HTTP_RETRIES", "3"))
 HTTP_BACKOFF = float(os.getenv("MOEX_HTTP_BACKOFF", "0.5"))
+RATE_LIMIT_RPS = float(os.getenv("MOEX_RATE_LIMIT", "0"))  # 0 = disabled
+class RateLimiter:
+    """Simple async token bucket rate limiter.
+
+    rate: tokens (requests) per second.
+    burst: maximum accumulated tokens.
+    """
+
+    def __init__(self, rate: float, burst: int | None = None):
+        if rate <= 0:
+            raise ValueError("rate must be > 0")
+        self.rate = rate
+        self.capacity = burst if burst and burst > 0 else max(1, int(rate))
+        self.tokens = self.capacity
+        self.updated = asyncio.get_event_loop().time()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            # Refill tokens
+            elapsed = now - self.updated
+            if elapsed > 0:
+                refill = elapsed * self.rate
+                if refill > 0:
+                    self.tokens = min(self.capacity, self.tokens + refill)
+                    self.updated = now
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return
+            # Need to wait: compute time to next token
+            needed = 1 - self.tokens
+            wait_time = needed / self.rate
+        # Release lock before sleeping
+        await asyncio.sleep(wait_time)
+        # Recursive attempt (could also loop)
+        await self.acquire()
+
 
 
 # --- Логирование ---
@@ -91,6 +129,7 @@ async def fetch_range(
     dr_start: dt.date,
     dr_end: dt.date,
     semaphore: asyncio.Semaphore,
+    rate_limiter: RateLimiter | None,
 ) -> tuple[list[list[Any]], list[str] | None]:
     url = (
         "https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/"
@@ -102,6 +141,8 @@ async def fetch_range(
         while True:
             attempt += 1
             try:
+                if rate_limiter:
+                    await rate_limiter.acquire()
                 async with session.get(url, timeout=HTTP_TIMEOUT) as resp:
                     if resp.status >= 500:
                         raise aiohttp.ClientResponseError(
@@ -141,6 +182,8 @@ async def fetch_range(
                         while fetched < total_rows_reported and start < max_expected:
                             page_url = f"{url}&start={start}"
                             try:
+                                if rate_limiter:
+                                    await rate_limiter.acquire()
                                 async with session.get(page_url, timeout=HTTP_TIMEOUT) as page_resp:
                                     if page_resp.status != 200:
                                         txt = await page_resp.text()
@@ -185,8 +228,9 @@ async def fetch_security(
     board: str,
     ranges: Sequence[tuple[dt.date, dt.date]],
     semaphore: asyncio.Semaphore,
+    rate_limiter: RateLimiter | None,
 ) -> tuple[list[list[Any]], list[str] | None]:
-    tasks = [fetch_range(session, secid, board, r[0], r[1], semaphore) for r in ranges]
+    tasks = [fetch_range(session, secid, board, r[0], r[1], semaphore, rate_limiter) for r in ranges]
     results = await asyncio.gather(*tasks)
     all_rows: list[list[Any]] = []
     columns: list[str] | None = None
@@ -292,6 +336,13 @@ async def async_run(args: argparse.Namespace) -> None:
     args._effective_end_date = end_date  # type: ignore[attr-defined]
     async with aiohttp.ClientSession(headers={"User-Agent": "moex-loader/1.0"}) as session:
         semaphore = asyncio.Semaphore(args.max_concurrency)
+        rate_limiter = None
+        if getattr(args, "rate_limit", None) and args.rate_limit > 0:
+            try:
+                rate_limiter = RateLimiter(args.rate_limit)
+                logging.info("Rate limiting включен: %.2f rps", args.rate_limit)
+            except ValueError as e:
+                logging.error("Не удалось включить rate limit: %s", e)
         # Поддержка dry-run: если включен, не открываем БД для записи, только читаем список инструментов из нее (если нужно)
         conn: sqlite3.Connection | None = None
         try:
@@ -334,7 +385,7 @@ async def async_run(args: argparse.Namespace) -> None:
                         continue
                     ranges = get_date_ranges(start_date, end_date, args.step_days)
                     logging.info("%s %s: диапазонов %s (с %s по %s)%s", secid, board, len(ranges), start_date, end_date, " [dry-run]" if args.dry_run else "")
-                    rows, cols = await fetch_security(session, secid, board, ranges, semaphore)
+                    rows, cols = await fetch_security(session, secid, board, ranges, semaphore, rate_limiter)
                     if not rows:
                         logging.info("%s %s: новых строк нет", secid, board)
                         continue
@@ -387,6 +438,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--since", help="Принудительная дата начала (YYYY-MM-DD), перекрывает инкремент и --days")
     p.add_argument("--days", type=int, help="Ограничить диапазон последними N днями (игнорируется если задан --since)")
     p.add_argument("--dry-run", action="store_true", help="Загрузить и сформировать экспорт без записи в БД")
+    p.add_argument("--rate-limit", type=float, help="Ограничить частоту запросов (RPS), 0 или пропуск = без лимита")
     p.add_argument("--export", nargs="?", const="moex_data.xlsx", help="Экспорт в Excel (опционально имя файла)")
     p.add_argument("--export-json", nargs="?", const="moex_data.json", help="Экспорт в JSON (опционально имя файла)")
     p.add_argument("--log-level", default="INFO", help="Уровень логирования (DEBUG/INFO/WARNING/...)")
