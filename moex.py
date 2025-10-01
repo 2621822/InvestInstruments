@@ -18,6 +18,8 @@ import logging
 import os
 import sqlite3
 import datetime as dt
+import hashlib
+import pathlib
 from typing import Sequence, Iterable, Any
 
 import aiohttp
@@ -35,6 +37,7 @@ HTTP_TIMEOUT = int(os.getenv("MOEX_HTTP_TIMEOUT", "20"))
 HTTP_RETRIES = int(os.getenv("MOEX_HTTP_RETRIES", "3"))
 HTTP_BACKOFF = float(os.getenv("MOEX_HTTP_BACKOFF", "0.5"))
 RATE_LIMIT_RPS = float(os.getenv("MOEX_RATE_LIMIT", "0"))  # 0 = disabled
+CACHE_DIR_ENV = os.getenv("MOEX_CACHE_DIR")
 class RateLimiter:
     """Simple async token bucket rate limiter.
 
@@ -130,6 +133,7 @@ async def fetch_range(
     dr_end: dt.date,
     semaphore: asyncio.Semaphore,
     rate_limiter: RateLimiter | None,
+    cache_dir: pathlib.Path | None,
 ) -> tuple[list[list[Any]], list[str] | None]:
     url = (
         "https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/"
@@ -143,6 +147,23 @@ async def fetch_range(
             try:
                 if rate_limiter:
                     await rate_limiter.acquire()
+                # --- cache lookup ---
+                if cache_dir:
+                    cache_key = hashlib.sha1(url.encode()).hexdigest()
+                    cache_file = cache_dir / f"{cache_key}.json"
+                    if cache_file.exists():
+                        try:
+                            with cache_file.open("r", encoding="utf-8") as cf:
+                                data = json.load(cf)
+                            history = data.get("history") or {}
+                            columns = history.get("columns")
+                            rows = history.get("data") or []
+                            cursor = data.get("history.cursor") or {}
+                            logging.debug("Cache hit %s", url)
+                            # Skip pagination for cached entry (assumed fully cached)
+                            return rows, columns
+                        except Exception as ce:  # noqa: BLE001
+                            logging.warning("Cache read error (%s): %s", cache_file, ce)
                 async with session.get(url, timeout=HTTP_TIMEOUT) as resp:
                     if resp.status >= 500:
                         raise aiohttp.ClientResponseError(
@@ -208,6 +229,14 @@ async def fetch_range(
                     logging.debug(
                         "Fetched %s rows for %s %s %s-%s (reported total=%s)", len(rows), secid, board, dr_start, dr_end, total_rows_reported
                     )
+                    # store in cache (only if main page succeeded and no pagination missing)
+                    if cache_dir:
+                        try:
+                            cache_dir.mkdir(parents=True, exist_ok=True)
+                            with cache_file.open("w", encoding="utf-8") as cf:
+                                json.dump(data, cf)
+                        except Exception as we:  # noqa: BLE001
+                            logging.debug("Cache write skip (%s): %s", cache_file, we)
                     return rows, columns
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 if attempt >= HTTP_RETRIES:
@@ -230,7 +259,9 @@ async def fetch_security(
     semaphore: asyncio.Semaphore,
     rate_limiter: RateLimiter | None,
 ) -> tuple[list[list[Any]], list[str] | None]:
-    tasks = [fetch_range(session, secid, board, r[0], r[1], semaphore, rate_limiter) for r in ranges]
+    # cache_dir passed through args inside wrapper (monkey patch later)
+    cache_dir: pathlib.Path | None = getattr(fetch_security, "_cache_dir", None)  # type: ignore[attr-defined]
+    tasks = [fetch_range(session, secid, board, r[0], r[1], semaphore, rate_limiter, cache_dir) for r in ranges]
     results = await asyncio.gather(*tasks)
     all_rows: list[list[Any]] = []
     columns: list[str] | None = None
@@ -343,6 +374,15 @@ async def async_run(args: argparse.Namespace) -> None:
                 logging.info("Rate limiting включен: %.2f rps", args.rate_limit)
             except ValueError as e:
                 logging.error("Не удалось включить rate limit: %s", e)
+        cache_dir = None
+        if getattr(args, "cache_dir", None):
+            cache_dir = pathlib.Path(args.cache_dir)
+            logging.info("Файловый кэш: %s", cache_dir)
+        elif CACHE_DIR_ENV:
+            cache_dir = pathlib.Path(CACHE_DIR_ENV)
+            logging.info("Файловый кэш (env): %s", cache_dir)
+        # attach cache_dir to fetch_security so it propagates
+        setattr(fetch_security, "_cache_dir", cache_dir)
         # Поддержка dry-run: если включен, не открываем БД для записи, только читаем список инструментов из нее (если нужно)
         conn: sqlite3.Connection | None = None
         try:
@@ -439,6 +479,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--days", type=int, help="Ограничить диапазон последними N днями (игнорируется если задан --since)")
     p.add_argument("--dry-run", action="store_true", help="Загрузить и сформировать экспорт без записи в БД")
     p.add_argument("--rate-limit", type=float, help="Ограничить частоту запросов (RPS), 0 или пропуск = без лимита")
+    p.add_argument("--cache-dir", help="Каталог файлового кэша ответов ISS (MOEX_CACHE_DIR)")
     p.add_argument("--export", nargs="?", const="moex_data.xlsx", help="Экспорт в Excel (опционально имя файла)")
     p.add_argument("--export-json", nargs="?", const="moex_data.json", help="Экспорт в JSON (опционально имя файла)")
     p.add_argument("--log-level", default="INFO", help="Уровень логирования (DEBUG/INFO/WARNING/...)")

@@ -144,6 +144,7 @@ python moex.py --instruments SBER GAZP LKOH
 | `--export-json [FILE]` | Export fetched data to JSON (default `moex_data.json`). |
 | `--dry-run` | Fetch & build export only, do not write to DB. |
 | `--rate-limit RPS` | Limit requests per second (token bucket). |
+| `--cache-dir PATH` | Directory for response file cache. |
 | `--log-level LEVEL` | Logging level. |
 
 ### Environment Variables (MOEX)
@@ -157,6 +158,7 @@ python moex.py --instruments SBER GAZP LKOH
 | `MOEX_HTTP_RETRIES` | Retry attempts | 3 |
 | `MOEX_HTTP_BACKOFF` | Base seconds for exp. backoff | 0.5 |
 | `MOEX_RATE_LIMIT` | Requests per second limit (0=disabled) | 0 |
+| `MOEX_CACHE_DIR` | Directory for response cache | (none) |
 
 ### Example: Last 30 Days Only
 
