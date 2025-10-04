@@ -1,4 +1,11 @@
-"""Investment instruments helper utilities."""
+"""Утилиты для работы с инвестиционными инструментами и консенсус-прогнозами.
+
+Основные возможности:
+ - Управление списком перспективных бумаг (добавление, первичное наполнение, обновление атрибутов)
+ - Получение и сохранение консенсус-прогнозов и целей аналитиков через API Тинькофф Инвест
+ - Историзация данных (с хранением предыдущих версий, ограничением глубины и очисткой устаревших записей)
+ - Экспорт данных в Excel для последующего анализа
+"""
 
 from __future__ import annotations
 
@@ -7,22 +14,29 @@ import logging
 import logging.handlers
 import os
 import time
+import random
+import shlex
+from math import isfinite
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Iterable, Any
 
 import openpyxl
 import requests
+from requests.exceptions import SSLError as RequestsSSLError
 import sqlite3
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
-# --- CONFIG ------------------------------------------------------------------
+# ============================================================================
+# ТЕХНИЧЕСКАЯ ЧАСТЬ / ИНИЦИАЛИЗАЦИЯ / КОНФИГУРАЦИЯ
+# (инфраструктурные константы, логирование, HTTP / утилиты низкого уровня)
+# ============================================================================
 DB_PATH = Path("GorbunovInvestInstruments.db")
 
-# ВАЖНО: Лучше не хранить токен в коде. Если переменная окружения отсутствует — выводим предупреждение.
+# ВАЖНО: Токен не следует жёстко прописывать в коде. Если переменная окружения отсутствует — выводим предупреждение.
 TOKEN = os.getenv("TINKOFF_INVEST_TOKEN")
 if not TOKEN:
 	logging.warning(
@@ -30,33 +44,164 @@ if not TOKEN:
 	)
 	TOKEN = ""  # пустая строка — явный маркер отсутствия токена
 
+# Дополнительный fallback: если переменной окружения нет, пробуем прочитать локальный файл tinkoff_token.txt
+if not TOKEN:
+	token_file = Path("tinkoff_token.txt")
+	if token_file.exists():
+		try:
+			file_token = token_file.read_text(encoding="utf-8").strip()
+			if file_token:
+				TOKEN = file_token
+				logging.info("Токен загружен из tinkoff_token.txt (переменная окружения отсутствовала).")
+		except Exception as exc:
+			logging.warning("Не удалось прочитать tinkoff_token.txt: %s", exc)
+
 API_BASE_URL = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService"
 FIND_ENDPOINT = "FindInstrument"
 GET_ENDPOINT = "GetInstrumentBy"
 GET_FORECAST_ENDPOINT = "GetForecastBy"
 
 SESSION = requests.Session()
-# Возможность отключать верификацию SSL только через переменную (по умолчанию включено)
+# Возможность отключать проверку SSL только через переменную окружения (по умолчанию включено и так безопаснее)
 SESSION.verify = os.getenv("APP_DISABLE_SSL_VERIFY", "0") not in {"1", "true", "True"}
 if not SESSION.verify:
 	urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 	logging.warning("SSL verify отключен (APP_DISABLE_SSL_VERIFY=1). Используйте только в отладочных целях.")
 
-API_TIMEOUT = int(os.getenv("API_TIMEOUT", "15"))
-API_MAX_ATTEMPTS = int(os.getenv("API_MAX_ATTEMPTS", "3"))
-API_BACKOFF_BASE = float(os.getenv("API_BACKOFF_BASE", "0.5"))  # сек
-MAX_CONSENSUS_PER_UID = int(os.getenv("CONSENSUS_MAX_PER_UID", "300"))
-MAX_TARGETS_PER_ANALYST = int(os.getenv("CONSENSUS_MAX_TARGETS_PER_ANALYST", "100"))
+API_TIMEOUT = int(os.getenv("API_TIMEOUT", "15"))  # таймаут (сек) для HTTP запросов к API (override через переменную окружения API_TIMEOUT)
+API_MAX_ATTEMPTS = int(os.getenv("API_MAX_ATTEMPTS", "3"))  # максимальное число попыток (ретраев) при ошибках запроса перед отказом (override через API_MAX_ATTEMPTS)
+API_BACKOFF_BASE = float(os.getenv("API_BACKOFF_BASE", "0.5"))  # базовый интервал (сек) для экспоненциальной паузы между повторными попытками
+MAX_CONSENSUS_PER_UID = int(os.getenv("CONSENSUS_MAX_PER_UID", "300"))  # максимум исторических consensus_forecasts записей на один uid (старые удаляются при очистке; override через CONSENSUS_MAX_PER_UID)
+MAX_TARGETS_PER_ANALYST = int(os.getenv("CONSENSUS_MAX_TARGETS_PER_ANALYST", "100"))  # максимальное число записей consensus_targets на пару (uid, company) прежде чем лишние будут удалены (override через CONSENSUS_MAX_TARGETS_PER_ANALYST)
 MAX_HISTORY_DAYS = int(os.getenv("CONSENSUS_MAX_HISTORY_DAYS", "1000"))  # возраст записей (дней), старше которого данные удаляются (0/<=0 отключает)
+CONSENSUS_AUTO_FETCH = os.getenv("CONSENSUS_AUTO_FETCH", "1").lower() in {"1", "true", "yes", "y"}  # (начальное значение) включать ли авто-дозагрузку прогнозов при старте и добавлении новой бумаги – используйте is_auto_fetch_enabled()
+
+# --- Метрики процесса (аггрегируются за время жизни) ---
+METRICS: dict[str, int | float] = {
+	"api_requests": 0,
+	"api_failures": 0,
+	"api_retries": 0,
+	"forecast_404": 0,
+}
+
+
+def is_auto_fetch_enabled() -> bool:
+	"""Вернуть актуальное состояние флага авто-дозагрузки.
+
+	Читает переменную окружения при каждом вызове, позволяя изменять поведение на лету
+	(например, через web UI без перезапуска процесса).
+	"""
+	return os.getenv("CONSENSUS_AUTO_FETCH", "1").lower() in {"1", "true", "yes", "y"}
+
+
+def current_limits() -> dict[str, int | None]:
+	"""Актуальные лимиты (динамически из переменных окружения с fallback к стартовым константам)."""
+
+	def _int(name: str, default: int) -> int:
+		try:
+			return int(os.getenv(name, str(default)))
+		except ValueError:
+			return default
+
+	return {
+		"max_consensus_per_uid": _int("CONSENSUS_MAX_PER_UID", MAX_CONSENSUS_PER_UID),
+		"max_targets_per_analyst": _int("CONSENSUS_MAX_TARGETS_PER_ANALYST", MAX_TARGETS_PER_ANALYST),
+		"max_history_days": _int("CONSENSUS_MAX_HISTORY_DAYS", MAX_HISTORY_DAYS),
+	}
+
+
+def EnsureForecastsForMissingShares(db_path: Path, token: str, *, prune: bool = True) -> None:
+	"""Проверить наличие прогнозов для всех бумаг и дозагрузить для тех, у кого их ещё нет.
+
+	Сценарии использования:
+	- Автоматический вызов при старте приложения (обеспечивает появление прогнозов для новых UID,
+	  добавленных вручную или внешними скриптами напрямую в таблицу perspective_shares)
+	- Может вызываться после операций массового добавления (fill-start / внешняя миграция)
+
+	Логика:
+	1. Собираем список uid из perspective_shares
+	2. Для каждого uid проверяем, есть ли хотя бы одна строка в consensus_forecasts ИЛИ consensus_targets
+	   (достаточно одного присутствия, чтобы считать прогнозы «загруженными»)
+	3. Если прогнозов нет — запрашиваем (consensus, targets) и сохраняем
+	4. В конце (если были добавления и prune=True) применяем PruneHistory с глобальными лимитами
+	"""
+
+	if not token:
+		logging.debug("EnsureForecastsForMissingShares: токен отсутствует — пропуск дозагрузки.")
+		return
+
+	start_ts = time.time()
+	added_for = 0
+	added_details: list[tuple[str, str | None]] = []  # (uid, ticker)
+
+	with sqlite3.connect(db_path) as conn:
+		cursor = conn.cursor()
+		# Получаем только те UID, у которых НЕТ ни одной записи ни в одной таблице (эффективно)
+		cursor.execute(
+			"""
+			SELECT ps.uid
+			FROM perspective_shares ps
+			WHERE NOT EXISTS (SELECT 1 FROM consensus_forecasts cf WHERE cf.uid = ps.uid)
+			  AND NOT EXISTS (SELECT 1 FROM consensus_targets ct WHERE ct.uid = ps.uid)
+			ORDER BY ps.uid
+			"""
+		)
+		missing_uids = [row[0] for row in cursor.fetchall()]
+
+	if not missing_uids:
+		logging.debug("EnsureForecastsForMissingShares: все бумаги уже имеют хотя бы один прогноз (consensus или targets).")
+		return
+
+	for uid in missing_uids:
+		consensus, targets = GetConsensusByUid(uid, token)
+		AddConsensusForecasts(db_path, consensus)
+		AddConsensusTargets(db_path, targets)
+		ticker: str | None = None
+		if isinstance(consensus, dict):
+			ticker = consensus.get("ticker") or consensus.get("figi")
+		if not ticker and targets:
+			first = targets[0]
+			ticker = first.get("ticker") or first.get("figi")
+		if consensus or targets:
+			added_for += 1
+			added_details.append((uid, ticker))
+		else:
+			logging.debug("EnsureForecastsForMissingShares: по uid %s прогнозов сейчас нет (ответ пустой).", uid)
+
+	if added_for:
+		duration = time.time() - start_ts
+		details_str = ", ".join(f"{u}:{t if t else '?'}" for u, t in added_details)
+		logging.info(
+			"EnsureForecastsForMissingShares: дозагружены прогнозы для %s бумаг за %.2fs (%s).",
+			added_for,
+			duration,
+			details_str,
+		)
+		if prune:
+			limits = current_limits()
+			PruneHistory(
+				db_path,
+				limits["max_consensus_per_uid"],
+				limits["max_targets_per_analyst"],
+				max_age_days=limits["max_history_days"],
+			)
+	else:
+		logging.debug("EnsureForecastsForMissingShares: подходящих для дозагрузки бумаг не осталось.")
 
 def setup_logging() -> None:
-	"""Configure logging with both console and rotating file handler (idempotent)."""
-	if getattr(setup_logging, "_configured", False):  # prevent duplicate handlers
+	"""Инициализировать логирование (консоль + файл с ротацией). Повторный вызов безопасен.
+
+	Структура формата: Время | Уровень | Сообщение
+	Параметры управляются переменными окружения:
+	- APP_LOG_LEVEL
+	- APP_LOG_FILE
+	"""
+	if getattr(setup_logging, "_configured", False):  # уже настроено — повторную настройку пропускаем
 		return
 	log_level = os.getenv("APP_LOG_LEVEL", "INFO").upper()
 	logger = logging.getLogger()
 	logger.setLevel(log_level)
-	for h in list(logger.handlers):  # remove default handlers if any
+	for h in list(logger.handlers):  # удаляем предустановленные обработчики (если есть)
 		logger.removeHandler(h)
 	formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 	console = logging.StreamHandler()
@@ -66,25 +211,44 @@ def setup_logging() -> None:
 	file_handler = logging.handlers.RotatingFileHandler(log_file, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
 	file_handler.setFormatter(formatter)
 	logger.addHandler(file_handler)
-	setup_logging._configured = True  # type: ignore[attr-defined]
+	setup_logging._configured = True  # служебный флаг, чтобы не конфигурировать повторно (type: ignore)
 
 
 setup_logging()
 
+# Optional automatic history update & potentials recompute on start (controlled by env variables)
+try:  # isolated so any failure does not break primary functionality
+	from . import auto_update as _auto_update  # type: ignore
+	_auto_update.maybe_run_on_start()
+except Exception as _auto_exc:  # noqa: F841, BLE001
+	logging.debug("auto_update initialization skipped: %s", _auto_exc)
+
+# Необязательное принудительное применение UTF-8 для stdout (устранение "кракозябр" в консоли Windows)
+if os.getenv("APP_FORCE_UTF8", "0") in {"1", "true", "True"}:
+	try:
+		import sys
+		if hasattr(sys.stdout, "reconfigure"):
+			sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+			logging.info("Консоль переведена в UTF-8 (APP_FORCE_UTF8=1)")
+	except Exception as _enc_exc:  # noqa: F841
+		logging.warning("Не удалось переключить stdout в UTF-8")
+
 
 # --- API HELPERS -------------------------------------------------------------
 def PostApiHeaders(token: str) -> dict[str, str]:
-	"""Return headers required for API authorization."""
+	"""Сформировать заголовки авторизации для POST запросов к API."""
 
 	return {"Authorization": f"Bearer {token}"}
 
 
 def _post(endpoint: str, payload: dict, token: str) -> dict | None:
-	"""Send a POST request to the API with retry/backoff; return JSON or None.
+	"""Отправить POST запрос к API с повторными попытками.
 
-	Retry logic configurable через переменные окружения:
-	- API_MAX_ATTEMPTS (default 3)
-	- API_BACKOFF_BASE (default 0.5s), экспоненциально: base * 2^(attempt-1)
+	Поведение повторов управляется переменными окружения:
+	- API_MAX_ATTEMPTS — максимальное число попыток
+	- API_BACKOFF_BASE — базовый интервал экспоненциальной задержки (backoff = base * 2^(attempt-1))
+
+	Возврат: dict (JSON) или None при неуспехе.
 	"""
 
 	url = f"{API_BASE_URL}/{endpoint}"
@@ -92,25 +256,78 @@ def _post(endpoint: str, payload: dict, token: str) -> dict | None:
 		logging.error("Токен не задан. Запрос %s не будет выполнен.", endpoint)
 		return None
 	headers = PostApiHeaders(token)
+	insecure_fallback_enabled = os.getenv("API_SSL_INSECURE_FALLBACK", "0").lower() in {"1", "true", "yes"}
 	for attempt in range(1, API_MAX_ATTEMPTS + 1):
 		try:
 			response = SESSION.post(url, json=payload, headers=headers, timeout=API_TIMEOUT)
+			METRICS["api_requests"] += 1
+			if response.status_code == 404 and endpoint == GET_FORECAST_ENDPOINT:
+				# Отсутствие консенсуса — не ошибка
+				METRICS["forecast_404"] += 1
+				logging.info("GetForecastBy 404 (нет данных) payload=%s", payload)
+				return None
 			status = response.status_code
 			if 500 <= status < 600:
-				raise requests.RequestException(f"Server error {status}")
+				raise requests.RequestException(f"Ошибка сервера {status}")
 			response.raise_for_status()
 			try:
 				return response.json()
 			except ValueError:
-				logging.error("API response from %s is not valid JSON", endpoint)
+				logging.error("Ответ API %s не является корректным JSON", endpoint)
 				return None
-		except requests.RequestException as exc:
+		except RequestsSSLError as ssl_exc:
+			# Специальный fallback: при первой SSL ошибке можно попробовать отключить проверку сертификата (если разрешено).
+			if insecure_fallback_enabled:
+				logging.warning(
+					"SSL ошибка при запросе %s: %s. Пробуем повторно с отключенной проверкой сертификата (insecure fallback).",
+					endpoint,
+					ssl_exc,
+				)
+				try:
+					# Одноразовый небезопасный запрос (не меняем SESSION.verify глобально)
+					with requests.Session() as tmp_sess:
+						tmp_sess.verify = False
+						urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+						insecure_resp = tmp_sess.post(url, json=payload, headers=headers, timeout=API_TIMEOUT)
+						insecure_status = insecure_resp.status_code
+						if 500 <= insecure_status < 600:
+							raise requests.RequestException(f"Ошибка сервера {insecure_status}")
+						insecure_resp.raise_for_status()
+						try:
+							return insecure_resp.json()
+						except ValueError:
+							logging.error("(fallback) Ответ API %s не является корректным JSON", endpoint)
+							return None
+				except requests.RequestException as insecure_exc:
+					# Проваливаемся в общий блок повторов ниже как обычная ошибка
+					last_exc = insecure_exc  # noqa: F841 - just for clarity
+			# Если fallback не включен или тоже не удался – обрабатываем как обычную ошибку
 			if attempt == API_MAX_ATTEMPTS:
-				logging.error("API request to %s failed after %s attempts: %s", endpoint, attempt, exc)
+				logging.error("Запрос к API %s не выполнен после %s попыток (SSL): %s", endpoint, attempt, ssl_exc)
 				return None
 			backoff = API_BACKOFF_BASE * (2 ** (attempt - 1))
+			# Добавим небольшой джиттер чтобы избежать одновременных запросов при массовых операциях
+			backoff += random.uniform(0, API_BACKOFF_BASE)
 			logging.warning(
-				"API request to %s failed (attempt %s/%s): %s. Retry in %.2fs",
+				"SSL сбой запроса к API %s (попытка %s/%s): %s. Повтор через %.2fс",
+				endpoint,
+				attempt,
+				API_MAX_ATTEMPTS,
+				ssl_exc,
+				backoff,
+			)
+			time.sleep(backoff)
+		except requests.RequestException as exc:
+			if attempt == API_MAX_ATTEMPTS:
+				logging.error("Запрос к API %s не выполнен после %s попыток: %s", endpoint, attempt, exc)
+				METRICS["api_failures"] += 1
+				return None
+			backoff = API_BACKOFF_BASE * (2 ** (attempt - 1))
+			backoff += random.uniform(0, API_BACKOFF_BASE)
+			if attempt > 0:
+				METRICS["api_retries"] += 1
+			logging.warning(
+				"Сбой запроса к API %s (попытка %s/%s): %s. Повтор через %.2fс",
 				endpoint,
 				attempt,
 				API_MAX_ATTEMPTS,
@@ -122,7 +339,7 @@ def _post(endpoint: str, payload: dict, token: str) -> dict | None:
 
 
 def _parse_money(value: dict | int | float | None) -> float | None:
-	"""Convert API money representation {units, nano} to a float."""
+	"""Преобразовать денежное значение API формата {units, nano} в число с плавающей запятой."""
 
 	if isinstance(value, dict):
 		try:
@@ -142,7 +359,7 @@ def _parse_money(value: dict | int | float | None) -> float | None:
 
 
 def _float_equal(a: float | None, b: float | None, tol: float = 1e-6) -> bool:
-	"""Compare two floating point numbers with tolerance, treating None as distinct."""
+	"""Сравнить два числа с плавающей точкой с заданной точностью (None считаются различными)."""
 
 	if a is None and b is None:
 		return True
@@ -151,13 +368,14 @@ def _float_equal(a: float | None, b: float | None, tol: float = 1e-6) -> bool:
 	return abs(a - b) <= tol
 
 
+
 def _now_iso() -> str:
-	"""Return current UTC timestamp (ISO, seconds precision)."""
+	"""Текущая отметка времени (UTC) в ISO формате без микросекунд."""
 	return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def _count_rows(conn: sqlite3.Connection, table: str, where: str | None = None, params: Iterable[Any] | None = None) -> int:
-	"""Return row count for a table with optional WHERE clause."""
+	"""Получить количество строк таблицы (с опциональным WHERE)."""
 	sql = f"SELECT COUNT(*) FROM {table}"
 	if where:
 		sql += f" WHERE {where}"
@@ -166,9 +384,9 @@ def _count_rows(conn: sqlite3.Connection, table: str, where: str | None = None, 
 
 
 def _is_older(dt_str: str | None, cutoff: datetime) -> bool:
-	"""Return True если строка даты (ISO или с суффиксом Z) старше cutoff.
+	"""Вернуть True, если строковая дата (ISO / с суффиксом Z) строго старше указанного порога.
 
-	При ошибке парсинга возвращает False (считаем запись валидной).
+	При невозможности распарсить дату возвращает False (такие записи не удаляем по возрасту).
 	"""
 	if not dt_str:
 		return False
@@ -185,23 +403,76 @@ def _is_older(dt_str: str | None, cutoff: datetime) -> bool:
 	return parsed < cutoff
 
 
-# --- API OPERATIONS ----------------------------------------------------------
+# ============================================================================
+# ФУНКЦИОНАЛЬНАЯ ЧАСТЬ (БИЗНЕС-ЛОГИКА API / ПОИСК ИНСТРУМЕНТОВ)
+# ============================================================================
 def GetUidInstrument(search_phrase: str, token: str) -> str | None:
-	"""Return instrument UID for a given search phrase."""
+	"""Получить UID инструмента по поисковой строке (тикер или часть названия)."""
 
-	payload = {
+	# Поддержка прямых идентификаторов:
+	lower = search_phrase.strip().lower()
+	# Явные префиксы uid:, figi:, isin: -> извлекаем значение сразу
+	for prefix in ("uid:", "figi:", "isin:"):
+		if lower.startswith(prefix):
+			val = search_phrase.split(":",1)[1].strip()
+			if prefix == "uid:":
+				return val
+			# Для figi / isin попробуем получить инструмент и вернуть его uid
+			id_type = "INSTRUMENT_ID_TYPE_FIGI" if prefix == "figi:" else "INSTRUMENT_ID_TYPE_ISIN"
+			payload = {"idType": id_type, "id": val}
+			data = _post(GET_ENDPOINT, payload, token)
+			inst = data.get("instrument") if data else None
+			if inst and inst.get("uid"):
+				return inst.get("uid")
+			return None
+	# Попытка распознать, если пользователь просто вставил голый UID (формат UUID v4) или FIGI (буквенно-цифровой, длина 12) / ISIN (длина 12, цифры+буквы, заканчивается цифрой контрольной)
+	import re
+	if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", search_phrase.strip()):
+		return search_phrase.strip()
+	# Простая эвристика для FIGI (обычно 12 символов, может содержать 0-9A-Z):
+	if re.fullmatch(r"[0-9A-Z]{12}", search_phrase.strip()):
+		payload = {"idType": "INSTRUMENT_ID_TYPE_FIGI", "id": search_phrase.strip()}
+		data = _post(GET_ENDPOINT, payload, token)
+		inst = data.get("instrument") if data else None
+		if inst and inst.get("uid"):
+			return inst.get("uid")
+	# ISIN: 12 символов, первые 2 буквы страны + 9 символов + контрольная цифра
+	if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{9}[0-9]", search_phrase.strip()):
+		payload = {"idType": "INSTRUMENT_ID_TYPE_ISIN", "id": search_phrase.strip()}
+		data = _post(GET_ENDPOINT, payload, token)
+		inst = data.get("instrument") if data else None
+		if inst and inst.get("uid"):
+			return inst.get("uid")
+
+	# Первая попытка: только торгуемые инструменты (apiTradeAvailableFlag=True)
+	base_payload = {
 		"query": search_phrase,
 		"instrumentKind": "INSTRUMENT_TYPE_SHARE",
 		"apiTradeAvailableFlag": True,
 	}
-	data = _post(FIND_ENDPOINT, payload, token)
-	if not data:
-		logging.warning("Не удалось найти бумаги по запросу '%s'", search_phrase)
-		return None
+	data = _post(FIND_ENDPOINT, base_payload, token)
+	instruments: list[dict] = []
+	if data:
+		instruments = data.get("instruments", []) or []
 
-	instruments = data.get("instruments", [])
+	# Fallback: если ничего не нашли (или API вернуло пусто), пробуем повторно БЕЗ apiTradeAvailableFlag
 	if not instruments:
-		logging.warning("Инструменты по запросу '%s' не найдены", search_phrase)
+		fallback_payload = {
+			"query": search_phrase,
+			"instrumentKind": "INSTRUMENT_TYPE_SHARE",
+		}
+		fallback_data = _post(FIND_ENDPOINT, fallback_payload, token)
+		if fallback_data:
+			instruments = fallback_data.get("instruments", []) or []
+			if instruments:
+				logging.debug(
+					"GetUidInstrument: найдено только после fallback без apiTradeAvailableFlag (query='%s', count=%s)",
+					search_phrase,
+					len(instruments),
+				)
+
+	if not instruments:
+		logging.warning("Инструменты по запросу '%s' не найдены ни в основной выборке, ни в fallback", search_phrase)
 		return None
 
 	lower_query = search_phrase.lower()
@@ -215,7 +486,7 @@ def GetUidInstrument(search_phrase: str, token: str) -> str | None:
 
 
 def GetInstrumentByUid(uid: str, token: str) -> dict | None:
-	"""Return full instrument data for a UID."""
+	"""Получить полное описание инструмента по UID."""
 
 	payload = {"idType": "INSTRUMENT_ID_TYPE_UID", "id": uid}
 	data = _post(GET_ENDPOINT, payload, token)
@@ -238,7 +509,7 @@ def GetInstrumentByUid(uid: str, token: str) -> dict | None:
 
 
 def GetConsensusByUid(uid: str, token: str) -> tuple[dict | None, list[dict]]:
-	"""Return consensus forecast and analyst targets for a given instrument UID."""
+	"""Получить консенсус-прогноз и список целей аналитиков для заданного UID инструмента."""
 
 	payload = {"instrumentId": uid}
 	data = _post(GET_FORECAST_ENDPOINT, payload, token)
@@ -256,7 +527,7 @@ def GetConsensusByUid(uid: str, token: str) -> tuple[dict | None, list[dict]]:
 
 # --- DATABASE OPERATIONS -----------------------------------------------------
 def initialize_database(db_path: Path) -> None:
-	"""Ensure that the SQLite database file exists."""
+	"""Проверить доступность файла БД SQLite (создастся автоматически при первом подключении)."""
 
 	try:
 		with sqlite3.connect(db_path) as conn:
@@ -267,7 +538,11 @@ def initialize_database(db_path: Path) -> None:
 
 
 def CreateTables(db_path: Path) -> None:
-	"""Create required tables if they do not exist."""
+	"""Создать необходимые таблицы (если ещё не существуют).
+
+	Дополнительно гарантируем наличие индекса по (uid, recommendationDate) для ускорения
+	выборки последнего консенсус-прогноза.
+	"""
 
 	with sqlite3.connect(db_path) as conn:
 		cursor = conn.cursor()
@@ -315,16 +590,20 @@ def CreateTables(db_path: Path) -> None:
 		cursor.execute(
 			"CREATE INDEX IF NOT EXISTS idx_consensus_targets_ticker_date ON consensus_targets(ticker, recommendationDate)"
 		)
+		# Индекс для ускорения выборки последней записи по uid
+		cursor.execute(
+			"CREATE INDEX IF NOT EXISTS idx_consensus_forecasts_uid_date ON consensus_forecasts(uid, recommendationDate)"
+		)
 		conn.commit()
 
 
 def migrate_schema(db_path: Path) -> None:
-	"""Migrate existing schema to support historical consensus and multiple analyst targets.
+	"""Мигрировать схему БД для поддержки истории и нескольких аналитиков.
 
-	Old schema had PRIMARY KEY(uid) in consensus_forecasts / consensus_targets which prevented history.
-	New schema:
-		consensus_forecasts(id INTEGER PK AUTOINCREMENT, uid TEXT, ...)
-		consensus_targets(id INTEGER PK AUTOINCREMENT, uid TEXT, company TEXT, ... UNIQUE(uid, company, recommendationDate))
+	Старый вариант имел PRIMARY KEY(uid) и не позволял хранить историю.
+	Новый формат:
+	- consensus_forecasts: id AUTOINCREMENT, несколько записей на один uid
+	- consensus_targets: id AUTOINCREMENT + уникальность (uid, company, recommendationDate)
 	"""
 	with sqlite3.connect(db_path) as conn:
 		cursor = conn.cursor()
@@ -385,7 +664,7 @@ def migrate_schema(db_path: Path) -> None:
 
 
 def FillingStartDdata(db_path: Path) -> None:
-	"""Fill the perspective_shares table with initial set of instruments."""
+	"""Первичное наполнение таблицы perspective_shares базовым набором бумаг."""
 
 	with sqlite3.connect(db_path) as conn:
 		cursor = conn.cursor()
@@ -413,7 +692,7 @@ def FillingStartDdata(db_path: Path) -> None:
 
 
 def FillingSharesData(db_path: Path, token: str) -> None:
-	"""Ensure all attributes for each perspective share are populated."""
+	"""Дозаполнить отсутствующие атрибуты для каждой бумаги в perspective_shares."""
 
 	with sqlite3.connect(db_path) as conn:
 		cursor = conn.cursor()
@@ -427,11 +706,9 @@ def FillingSharesData(db_path: Path, token: str) -> None:
 			missing = [col for col in columns if col != "uid" and not data.get(col)]
 			if not missing:
 				continue
-
 			full_data = GetInstrumentByUid(data["uid"], token)
 			if not full_data:
 				continue
-
 			cursor.execute(
 				"""UPDATE perspective_shares SET
 						ticker=?,
@@ -444,21 +721,12 @@ def FillingSharesData(db_path: Path, token: str) -> None:
 						assetUid=?
 					WHERE uid=?""",
 				(
-					full_data["ticker"],
-					full_data["name"],
-					full_data["secid"],
-					full_data["isin"],
-					full_data["figi"],
-					full_data["classCode"],
-					full_data["instrumentType"],
-					full_data["assetUid"],
-					data["uid"],
+					full_data["ticker"], full_data["name"], full_data["secid"], full_data["isin"], full_data["figi"], full_data["classCode"], full_data["instrumentType"], full_data["assetUid"], data["uid"],
 				),
 			)
-			conn.commit()
 			updated_rows += 1
 			logging.info("Обновлены атрибуты для %s (%s)", full_data["name"], full_data["ticker"])
-
+		conn.commit()
 		total_rows = _count_rows(conn, "perspective_shares")
 		logging.info(
 			"Обновление атрибутов завершено. Затронуто строк: %s. Текущее количество строк: %s",
@@ -468,7 +736,7 @@ def FillingSharesData(db_path: Path, token: str) -> None:
 
 
 def AddShareData(db_path: Path, search_phrase: str, token: str) -> None:
-	"""Add a new share to the perspective_shares table using a search phrase."""
+	"""Добавить новую бумагу в perspective_shares, найдя её по поисковой строке."""
 
 	uid = GetUidInstrument(search_phrase, token)
 	if not uid:
@@ -517,9 +785,190 @@ def AddShareData(db_path: Path, search_phrase: str, token: str) -> None:
 			total_rows,
 		)
 
+	# Автоматическая загрузка прогнозов сразу после добавления новой бумаги (если включено)
+	if is_auto_fetch_enabled():
+		if token:
+			with sqlite3.connect(db_path) as conn:
+				cur = conn.cursor()
+				cur.execute("SELECT COUNT(*) FROM consensus_forecasts WHERE uid=?", (full_data["uid"],))
+				before_cf = cur.fetchone()[0]
+				cur.execute("SELECT COUNT(*) FROM consensus_targets WHERE uid=?", (full_data["uid"],))
+				before_ct = cur.fetchone()[0]
+			consensus, targets = GetConsensusByUid(full_data["uid"], token)
+			AddConsensusForecasts(db_path, consensus)
+			AddConsensusTargets(db_path, targets)
+			with sqlite3.connect(db_path) as conn:
+				cur = conn.cursor()
+				cur.execute("SELECT COUNT(*) FROM consensus_forecasts WHERE uid=?", (full_data["uid"],))
+				after_cf = cur.fetchone()[0]
+				cur.execute("SELECT COUNT(*) FROM consensus_targets WHERE uid=?", (full_data["uid"],))
+				after_ct = cur.fetchone()[0]
+			added_cf = after_cf - before_cf
+			added_ct = after_ct - before_ct
+			limits = current_limits()
+			PruneHistory(
+				db_path,
+				limits["max_consensus_per_uid"],
+				limits["max_targets_per_analyst"],
+				max_age_days=limits["max_history_days"],
+			)
+			if added_cf or added_ct:
+				logging.info(
+					"Автозагрузка прогнозов для %s: добавлено consensus=%s, targets=%s.",
+					full_data["ticker"],
+					added_cf,
+					added_ct,
+				)
+			else:
+				logging.info(
+					"Автозагрузка прогнозов для %s: в источнике пока нет данных.",
+					full_data["ticker"],
+				)
+		else:
+			logging.warning(
+				"Токен отсутствует — автоматическая загрузка прогнозов для новой бумаги %s пропущена.",
+				full_data["ticker"],
+			)
+	else:
+		logging.debug("CONSENSUS_AUTO_FETCH=0 — автозагрузка прогнозов при добавлении %s отключена.", full_data["ticker"])
+
+
+def AddShareByIdentifier(db_path: Path, identifier: str, id_kind: str, token: str) -> None:
+	"""Добавить бумагу по прямому идентификатору (UID / FIGI / ISIN).
+
+	id_kind: one of 'UID', 'FIGI', 'ISIN'
+	"""
+	kind_map = {
+		'UID': 'INSTRUMENT_ID_TYPE_UID',
+		'FIGI': 'INSTRUMENT_ID_TYPE_FIGI',
+		'ISIN': 'INSTRUMENT_ID_TYPE_ISIN',
+	}
+	id_type = kind_map.get(id_kind.upper())
+	if not id_type:
+		logging.error("Неизвестный тип идентификатора %s", id_kind)
+		return
+	if not token:
+		logging.error("Токен отсутствует — нельзя загрузить инструмент по %s", id_kind)
+		return
+	data = _post(GET_ENDPOINT, {"idType": id_type, "id": identifier}, token)
+	inst = data.get("instrument") if data else None
+	if not inst:
+		logging.warning("Инструмент по %s=%s не найден", id_kind, identifier)
+		return
+	full_data = {
+		"ticker": inst.get("ticker", ""),
+		"name": inst.get("name", ""),
+		"uid": inst.get("uid", ""),
+		"secid": inst.get("ticker", ""),
+		"isin": inst.get("isin", ""),
+		"figi": inst.get("figi", ""),
+		"classCode": inst.get("classCode", ""),
+		"instrumentType": inst.get("instrumentType", ""),
+		"assetUid": inst.get("assetUid", ""),
+	}
+	if not full_data["uid"]:
+		logging.warning("Ответ по %s=%s не содержит uid — пропуск", id_kind, identifier)
+		return
+	with sqlite3.connect(db_path) as conn:
+		cur = conn.cursor()
+		cur.execute("SELECT 1 FROM perspective_shares WHERE uid=?", (full_data["uid"],))
+		if cur.fetchone():
+			logging.info("Инструмент %s (%s) уже присутствует.", full_data["name"], full_data["ticker"])
+			return
+		cur.execute(
+			"""INSERT INTO perspective_shares
+					(ticker, name, uid, secid, isin, figi, classCode, instrumentType, assetUid)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+			(
+				full_data["ticker"],
+				full_data["name"],
+				full_data["uid"],
+				full_data["secid"],
+				full_data["isin"],
+				full_data["figi"],
+				full_data["classCode"],
+				full_data["instrumentType"],
+				full_data["assetUid"],
+			),
+		)
+		conn.commit()
+	logging.info("Добавлен инструмент %s (%s) по %s=%s", full_data["name"], full_data["ticker"], id_kind, identifier)
+	if is_auto_fetch_enabled():
+		consensus, targets = GetConsensusByUid(full_data["uid"], token)
+		AddConsensusForecasts(db_path, consensus)
+		AddConsensusTargets(db_path, targets)
+		limits = current_limits()
+		PruneHistory(
+			db_path,
+			limits["max_consensus_per_uid"],
+			limits["max_targets_per_analyst"],
+			max_age_days=limits["max_history_days"],
+		)
+	else:
+		logging.debug("CONSENSUS_AUTO_FETCH=0 — прогнозы по %s не загружались.", full_data["ticker"])
+
+
+def AddSharesBatch(db_path: Path, queries: str, token: str) -> None:
+	"""Добавить несколько бумаг (разделители: запятая и/или пробелы, поддержка кавычек)."""
+	if not queries:
+		return
+	parts: list[str] = []
+	for chunk in queries.split(','):
+		chunk = chunk.strip()
+		if not chunk:
+			continue
+		for p in shlex.split(chunk):
+			p = p.strip()
+			if p:
+				parts.append(p)
+	if not parts:
+		logging.warning("Batch: нет валидных запросов")
+		return
+	added = 0
+	for q in parts:
+		with sqlite3.connect(db_path) as conn:
+			cur = conn.cursor()
+			cur.execute("SELECT COUNT(*) FROM perspective_shares")
+			before = cur.fetchone()[0]
+		AddShareData(db_path, q, token)
+		with sqlite3.connect(db_path) as conn:
+			cur = conn.cursor()
+			cur.execute("SELECT COUNT(*) FROM perspective_shares")
+			after = cur.fetchone()[0]
+		if after > before:
+			added += 1
+	logging.info("Batch добавление завершено: запросов=%s, добавлено=%s", len(parts), added)
+
+
+def DeleteShareData(db_path: Path, uid: str, *, delete_forecasts: bool = True) -> bool:
+    """Удалить бумагу по UID.
+
+    Параметры:
+    - delete_forecasts: также удалить связанные consensus_forecasts и consensus_targets.
+
+    Возвращает True если бумага была удалена.
+    """
+    removed = False
+    with sqlite3.connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT uid, ticker, name FROM perspective_shares WHERE uid=?", (uid,))
+        row = cur.fetchone()
+        if not row:
+            logging.warning("Удаление: бумага uid=%s не найдена.", uid)
+            return False
+        cur.execute("DELETE FROM perspective_shares WHERE uid=?", (uid,))
+        removed = cur.rowcount > 0
+        if delete_forecasts:
+            cur.execute("DELETE FROM consensus_forecasts WHERE uid=?", (uid,))
+            cur.execute("DELETE FROM consensus_targets WHERE uid=?", (uid,))
+        conn.commit()
+    if removed:
+        logging.info("Удалена бумага uid=%s (%s). Связанные прогнозы удалены=%s", uid, row[1], delete_forecasts)
+    return removed
+
 
 def AddConsensusForecasts(db_path: Path, consensus: dict | None) -> None:
-	"""Save consensus forecast if it differs from the latest stored record."""
+	"""Сохранить консенсус-прогноз, если он отличается от последней сохранённой записи."""
 
 	if not consensus:
 		logging.info("Консенсус данные отсутствуют, сохранение пропущено.")
@@ -537,6 +986,7 @@ def AddConsensusForecasts(db_path: Path, consensus: dict | None) -> None:
 	min_target = _parse_money(consensus.get("minTarget"))
 	max_target = _parse_money(consensus.get("maxTarget"))
 
+	new_inserted = False
 	with sqlite3.connect(db_path) as conn:
 		cursor = conn.cursor()
 		cursor.execute(
@@ -583,6 +1033,7 @@ def AddConsensusForecasts(db_path: Path, consensus: dict | None) -> None:
 			),
 		)
 		conn.commit()
+		new_inserted = True
 
 		total_rows = _count_rows(conn, "consensus_forecasts", "uid = ?", [uid])
 
@@ -591,19 +1042,26 @@ def AddConsensusForecasts(db_path: Path, consensus: dict | None) -> None:
 		ticker,
 		total_rows,
 	)
+	# Авто-пересчёт потенциала только если реально добавлена новая запись
+	if new_inserted:
+		try:
+			RecomputePotentialForUid(db_path, uid)
+		except Exception as exc:  # noqa: BLE001
+			logging.debug("Авто перерасчёт потенциала по %s не удался: %s", uid, exc)
 
 
 def AddConsensusTargets(db_path: Path, targets: list[dict]) -> None:
-	"""Persist analyst targets, avoiding duplicates."""
+	"""Сохранить цели аналитиков, пропуская уже существующие (избежание дублей)."""
 
 	if not targets:
 		logging.info("По прогнозам аналитиков данных нет.")
 		return
 
+	# Оптимизация: минимизируем количество SELECT, используя попытку вставки и обновление при расхождении.
 	inserted = 0
+	updated = 0
 	with sqlite3.connect(db_path) as conn:
 		cursor = conn.cursor()
-
 		for target in targets:
 			uid = target.get("uid")
 			ticker = target.get("ticker")
@@ -623,46 +1081,65 @@ def AddConsensusTargets(db_path: Path, targets: list[dict]) -> None:
 				)
 				continue
 
-			cursor.execute(
-				"""SELECT uid, ticker, company, recommendation, recommendationDate, currency, targetPrice, showName
-				       FROM consensus_targets
-				      WHERE uid = ? AND company = ? AND recommendationDate = ?""",
-				(uid, company, recommendation_date),
-			)
-			existing = cursor.fetchone()
-
-			if existing and (
-				existing[0] == uid
-				and existing[1] == ticker
-				and existing[2] == company
-				and existing[3] == recommendation
-				and existing[4] == recommendation_date
-				and existing[5] == currency
-				and _float_equal(existing[6], target_price)
-				and existing[7] == show_name
-			):
-				logging.info(
-					"Прогноз %s по %s за %s уже сохранен ранее.",
-					company,
-					ticker,
-					recommendation_date,
+			# Пытаемся вставить. Если запись уже есть (уникальный индекс), пропустим.
+			try:
+				cursor.execute(
+					"""INSERT OR IGNORE INTO consensus_targets
+						(uid, ticker, company, recommendation, recommendationDate, currency, targetPrice, showName)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+					(uid, ticker, company, recommendation, recommendation_date, currency, target_price, show_name),
 				)
+				if cursor.rowcount > 0:
+					inserted += 1
+					continue  # вставили — всё
+			except sqlite3.DatabaseError as exc:
+				logging.error("Ошибка вставки аналитического прогноза: %s", exc)
 				continue
 
+			# Запись существует — проверим, отличаются ли поля (минимальный SELECT)
 			cursor.execute(
-				"""INSERT INTO consensus_targets
-					(uid, ticker, company, recommendation, recommendationDate, currency, targetPrice, showName)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-				(uid, ticker, company, recommendation, recommendation_date, currency, target_price, show_name),
+				"""SELECT recommendation, currency, targetPrice, showName
+				   FROM consensus_targets
+				  WHERE uid=? AND company=? AND recommendationDate=?""",
+				(uid, company, recommendation_date),
 			)
-			inserted += 1
+			row = cursor.fetchone()
+			if not row:
+				# Редкая гонка: запись исчезла — пробуем ещё раз вставить без IGNORE
+				try:
+					cursor.execute(
+						"""INSERT INTO consensus_targets
+							(uid, ticker, company, recommendation, recommendationDate, currency, targetPrice, showName)
+						 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+						(uid, ticker, company, recommendation, recommendation_date, currency, target_price, show_name),
+					)
+					inserted += 1
+					continue
+				except sqlite3.DatabaseError:
+					continue
+			old_rec, old_currency, old_price, old_show = row
+			if (
+				old_rec != recommendation
+				or old_currency != currency
+				or (old_price is None and target_price is not None)
+				or (old_price is not None and not _float_equal(old_price, target_price))
+				or old_show != show_name
+			):
+				cursor.execute(
+					"""UPDATE consensus_targets
+					   SET recommendation=?, currency=?, targetPrice=?, showName=?, ticker=?
+					 WHERE uid=? AND company=? AND recommendationDate=?""",
+					(recommendation, currency, target_price, show_name, ticker, uid, company, recommendation_date),
+				)
+				updated += 1
 
 		conn.commit()
-	total_rows = _count_rows(conn, "consensus_targets")
+		total_rows = _count_rows(conn, "consensus_targets")
 
 	logging.info(
-		"Загрузка прогнозов аналитиков завершена. Добавлено записей: %s. Всего записей: %s",
+		"Загрузка прогнозов аналитиков завершена. Добавлено=%s, обновлено=%s. Всего записей: %s",
 		inserted,
+		updated,
 		total_rows,
 	)
 
@@ -676,12 +1153,12 @@ def UpdateConsensusForecasts(
 	max_targets_per_analyst: int | None = None,
 	max_history_days: int | None = None,
 ) -> None:
-	"""Fetch and store consensus data then prune according to provided limits.
+	"""Получить и сохранить свежие консенсус-данные, затем выполнить очистку по лимитам.
 
-	Parameters override precedence:
-	1. Explicit function arguments (from CLI)
-	2. Environment variables (CONSENSUS_MAX_PER_UID / CONSENSUS_MAX_TARGETS_PER_ANALYST / CONSENSUS_MAX_HISTORY_DAYS)
-	3. Hard-coded defaults in absence of env (already baked into module-level constants)
+	Приоритет источников параметров (от большего к меньшему):
+	1. Значения, переданные прямо в функцию (CLI аргументы)
+	2. Переменные окружения
+	3. Значения по умолчанию (константы в начале файла)
 	"""
 
 	with sqlite3.connect(db_path) as conn:
@@ -712,19 +1189,20 @@ def UpdateConsensusForecasts(
 
 
 def FillingConsensusData(db_path: Path, token: str, *, limit: int | None = None, sleep_sec: float = 0.0) -> None:
-	"""Первичное массовое наполнение consensus данными по всем бумагам.
+	"""Первичное массовое наполнение consensus данными (без очистки истории).
 
-	Проходит по всем uid из perspective_shares (опционально ограничивая их числом limit),
-	для каждой бумаги получает (consensus, targets) через GetConsensusByUid и сохраняет
-	их посредством AddConsensusForecasts / AddConsensusTargets.
+	Алгоритм:
+	1. Берёт список UID из perspective_shares (опционально усечённый по limit)
+	2. Для каждой бумаги запрашивает (consensus, targets)
+	3. Сохраняет через AddConsensusForecasts / AddConsensusTargets
 
 	Отличия от UpdateConsensusForecasts:
-	- Не выполняет PruneHistory (цель — накопить стартовый слой данных)
-	- Легковесное логирование процесса
+	- Не запускает PruneHistory (мы хотим сначала накопить исторический слой)
+	- Более простое логирование прогресса
 
 	Параметры:
-	- limit: если задано, обрабатывает только первые N бумаг
-	- sleep_sec: задержка между запросами (для throttling при необходимости)
+	- limit — ограничить количество обрабатываемых бумаг
+	- sleep_sec — пауза между запросами (для снижения нагрузки / обхода лимитов)
 	"""
 
 	with sqlite3.connect(db_path) as conn:
@@ -756,11 +1234,12 @@ def FillingConsensusData(db_path: Path, token: str, *, limit: int | None = None,
 
 
 def PruneHistory(db_path: Path, max_consensus: int, max_targets_per_analyst: int, *, max_age_days: int | None = MAX_HISTORY_DAYS) -> None:
-	"""Ограничить глубину хранения:
+	"""Очистить историю по лимитам и (опционально) возрасту.
 
-	- consensus_forecasts: максимум max_consensus записей на каждый uid
-	- consensus_targets: максимум max_targets_per_analyst записей на каждую пару (uid, company)
-	- (опционально) удалить записи старше max_age_days
+	Действия:
+	- Для каждого uid оставить не более max_consensus записей в consensus_forecasts
+	- Для каждой пары (uid, company) оставить не более max_targets_per_analyst записей в consensus_targets
+	- Если max_age_days > 0 — удалить записи старше указанного количества дней
 	"""
 	deleted_consensus = 0
 	deleted_targets = 0
@@ -805,15 +1284,12 @@ def PruneHistory(db_path: Path, max_consensus: int, max_targets_per_analyst: int
 		# --- age-based pruning (optional) ---
 		if max_age_days is not None and max_age_days > 0:
 			cutoff_dt = datetime.now(timezone.utc) - timedelta(days=max_age_days)
-			cutoff_iso_prefix = cutoff_dt.isoformat()  # ISO для лексикографического сравнения при одинаковом формате
-			# Так как форматы дат могут включать Z или +00:00, делаем отбор в Python
-			# consensus_forecasts
+			# Прямая очистка (если recommendationDate хранится в ISO) — оставляем безопасный Python отбор (уже был)
 			cursor.execute("SELECT id, recommendationDate FROM consensus_forecasts")
 			for _id, dt_str in cursor.fetchall():
 				if _is_older(dt_str, cutoff_dt):
 					cursor.execute("DELETE FROM consensus_forecasts WHERE id=?", (_id,))
 					deleted_consensus_age += 1
-			# consensus_targets
 			cursor.execute("SELECT id, recommendationDate FROM consensus_targets")
 			for _id, dt_str in cursor.fetchall():
 				if _is_older(dt_str, cutoff_dt):
@@ -843,7 +1319,7 @@ def PruneHistory(db_path: Path, max_consensus: int, max_targets_per_analyst: int
 
 
 def export_perspective_shares_to_excel(db_path: Path, filename: str = "perspective_shares.xlsx") -> None:
-	"""Export perspective_shares table to an Excel file."""
+	"""Экспортировать таблицу perspective_shares в Excel."""
 
 	with sqlite3.connect(db_path) as conn:
 		cursor = conn.cursor()
@@ -863,7 +1339,7 @@ def export_perspective_shares_to_excel(db_path: Path, filename: str = "perspecti
 
 
 def export_consensus_to_excel(db_path: Path, filename: str = "consensus_data.xlsx") -> None:
-	"""Export consensus_forecasts and consensus_targets tables into a single Excel file."""
+	"""Экспортировать consensus_forecasts и consensus_targets в один Excel-файл (отдельные листы)."""
 
 	tables = [
 		("consensus_forecasts", "Consensus Forecasts"),
@@ -894,12 +1370,329 @@ def export_consensus_to_excel(db_path: Path, filename: str = "consensus_data.xls
 	)
 
 
+# ================== ИНТЕГРАЦИЯ И РАСЧЁТ ПОТЕНЦИАЛОВ (СИНХРОННЫЙ LOADER) =====================
+
+
+def _get_prev_close(secid: str) -> tuple[float | None, str | None]:
+	"""Получить последнюю цену закрытия из новой таблицы moex_history_perspective_shares.
+
+	Legacy async loader и база moex_data.db больше не используются.
+	"""
+	try:
+		with sqlite3.connect("GorbunovInvestInstruments.db") as conn:
+			cur = conn.cursor()
+			cur.execute(
+				"SELECT CLOSE, COALESCE(TRADE_SESSION_DATE, TRADEDATE) FROM moex_history_perspective_shares WHERE SECID=? AND CLOSE IS NOT NULL ORDER BY COALESCE(TRADE_SESSION_DATE, TRADEDATE) DESC LIMIT 1",
+				(secid,),
+			)
+			row = cur.fetchone()
+			if row and row[0] is not None:
+				return float(row[0]), row[1]
+	except Exception:  # noqa: BLE001
+		return None, None
+	return None, None
+
+
+def ComputePotentials(db_path: Path, *, moex_db: Path | None = None, store: bool = True, stale_days: int = 10) -> list[dict[str, Any]]:
+	"""Рассчитать и (опционально) сохранить потенциалы в instrument_potentials.
+
+	pricePotentialRel = (consensusPrice - prevClose) / prevClose (хранится как отношение, не %).
+	Если отсутствует consensusPrice или prevClose <=0 — сохраняем NULL.
+	Помечаем isStale=1 если recommendationDate старше stale_days.
+	TODO: учесть корпоративные действия (дивиденды/сплиты) — запланировано.
+	"""
+	results: list[dict[str, Any]] = []
+
+	def _migrate_schema_if_needed() -> None:
+		"""Миграция схемы instrument_potentials к формату с уникальностью (uid, computedDate) без поля computedAt.
+
+		Legacy варианты могли содержать computedAt и не иметь computedDate. Теперь храним одну запись в день:
+		PRIMARY KEY(uid, computedDate). Поле computedAt удаляется как ненужное (оставляем только дату вычисления).
+		"""
+		with sqlite3.connect(db_path) as conn:
+			cur = conn.cursor()
+			cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='instrument_potentials'")
+			if not cur.fetchone():
+				return
+			cur.execute("PRAGMA table_info(instrument_potentials)")
+			cols = [r[1] for r in cur.fetchall()]
+			# Если уже нет computedAt и есть computedDate -> ничего не делаем
+			if 'computedDate' in cols and 'computedAt' not in cols:
+				return
+			logging.info("Миграция instrument_potentials: удаляем computedAt, обеспечиваем уникальность (uid, computedDate)")
+			conn.execute(
+				"""CREATE TABLE instrument_potentials_new (
+					uid TEXT,
+					ticker TEXT,
+					computedDate TEXT,
+					prevClose REAL,
+					consensusPrice REAL,
+					pricePotentialRel REAL,
+					isStale INTEGER DEFAULT 0,
+					PRIMARY KEY(uid, computedDate)
+				)"""
+			)
+			conn.execute("CREATE INDEX IF NOT EXISTS idx_instrument_potentials_rel ON instrument_potentials_new(pricePotentialRel)")
+			# Если старый формат содержал computedAt используем его для выбора последней записи дня
+			if 'computedAt' in cols:
+				try:
+					conn.execute(
+						"""
+						WITH ranked AS (
+						  SELECT uid,ticker,substr(computedAt,1,10) AS computedDate,prevClose,consensusPrice,pricePotentialRel,isStale,
+						         ROW_NUMBER() OVER (PARTITION BY uid,substr(computedAt,1,10) ORDER BY computedAt DESC) rn
+						  FROM instrument_potentials
+						)
+						INSERT INTO instrument_potentials_new(uid,ticker,computedDate,prevClose,consensusPrice,pricePotentialRel,isStale)
+						SELECT uid,ticker,computedDate,prevClose,consensusPrice,pricePotentialRel,isStale FROM ranked WHERE rn=1;
+						"""
+					)
+				except Exception:
+					# Fallback без оконных функций
+					conn.execute(
+						"""
+						INSERT INTO instrument_potentials_new(uid,ticker,computedDate,prevClose,consensusPrice,pricePotentialRel,isStale)
+						SELECT p.uid,p.ticker,substr(p.computedAt,1,10) AS computedDate,p.prevClose,p.consensusPrice,p.pricePotentialRel,p.isStale
+						FROM instrument_potentials p
+						WHERE p.computedAt = (
+						  SELECT MAX(p2.computedAt) FROM instrument_potentials p2
+						  WHERE p2.uid=p.uid AND substr(p2.computedAt,1,10)=substr(p.computedAt,1,10)
+						);
+						"""
+					)
+			else:
+				# Старый формат без computedDate но возможно без computedAt? Тогда просто проецируем
+				conn.execute(
+					"""INSERT INTO instrument_potentials_new(uid,ticker,computedDate,prevClose,consensusPrice,pricePotentialRel,isStale)
+					SELECT uid,ticker,substr(coalesce(computedDate,computedAt,datetime('now')),1,10) AS computedDate,prevClose,consensusPrice,pricePotentialRel,isStale FROM instrument_potentials"""
+				)
+			conn.execute("DROP TABLE instrument_potentials")
+			conn.execute("ALTER TABLE instrument_potentials_new RENAME TO instrument_potentials")
+			conn.commit()
+			logging.info("Миграция instrument_potentials завершена")
+
+	def _prune_duplicates() -> int:
+		"""Проверка дубликатов в старой схеме (если ещё есть) – после миграции ничего не делает."""
+		with sqlite3.connect(db_path) as conn:
+			cur = conn.cursor()
+			cur.execute("PRAGMA table_info(instrument_potentials)")
+			cols = [r[1] for r in cur.fetchall()]
+			if 'computedAt' in cols and 'computedDate' not in cols:
+				logging.info("Обнаружен очень старый формат без computedDate – запустить миграцию")
+				return 0
+			return 0
+
+	# Run migration (once per invocation if needed)
+	_migrate_schema_if_needed()
+	with sqlite3.connect(db_path) as conn:
+		cur = conn.cursor()
+		cur.execute("SELECT uid, ticker, secid FROM perspective_shares ORDER BY ticker")
+		shares = cur.fetchall()
+	# Подготовка таблицы
+	if store:
+		with sqlite3.connect(db_path) as conn:
+			cur = conn.cursor()
+			cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='instrument_potentials'")
+			if not cur.fetchone():
+				conn.execute(
+					"""CREATE TABLE instrument_potentials (
+						uid TEXT,
+						ticker TEXT,
+						computedDate TEXT,
+						prevClose REAL,
+						consensusPrice REAL,
+						pricePotentialRel REAL,
+						isStale INTEGER DEFAULT 0,
+						PRIMARY KEY(uid, computedDate)
+					)"""
+				)
+				conn.execute("CREATE INDEX IF NOT EXISTS idx_instrument_potentials_rel ON instrument_potentials(pricePotentialRel)")
+			conn.commit()
+	computed_date = _now_iso()[:10]
+	now_utc = datetime.now(timezone.utc)
+	for uid, ticker, secid in shares:
+		# Последний consensus
+		consensus_price: float | None = None
+		rec_date: str | None = None
+		with sqlite3.connect(db_path) as conn:
+			c2 = conn.cursor()
+			c2.execute(
+				"SELECT priceConsensus, recommendationDate FROM consensus_forecasts WHERE uid=? ORDER BY recommendationDate DESC LIMIT 1",
+				(uid,),
+			)
+			row = c2.fetchone()
+			if row:
+				consensus_price, rec_date = row
+		prev_close, prev_trade_dt = (None, None)
+		if secid:
+			prev_close, prev_trade_dt = _get_prev_close(secid)
+		potential = None
+		if consensus_price is not None and prev_close is not None and isfinite(prev_close) and prev_close > 0:
+			potential = (consensus_price - prev_close) / prev_close
+		is_stale = 0
+		if rec_date:
+			try:
+				rd = rec_date.rstrip('Z')
+				if rd.endswith('+00:00') or '+' in rd:
+					rd_dt = datetime.fromisoformat(rd)
+				else:
+					rd_dt = datetime.fromisoformat(rd)
+				if rd_dt.tzinfo is None:
+					rd_dt = rd_dt.replace(tzinfo=timezone.utc)
+				if (now_utc - rd_dt).days > stale_days:
+					is_stale = 1
+			except Exception:  # noqa: BLE001
+				pass
+		entry = {
+			"uid": uid,
+			"ticker": ticker,
+			"prevClose": prev_close,
+			"consensusPrice": consensus_price,
+			"pricePotentialRel": potential,
+			"isStale": is_stale,
+		}
+		results.append(entry)
+		if store:
+			try:
+				with sqlite3.connect(db_path) as conn:
+					conn.execute(
+						"INSERT OR REPLACE INTO instrument_potentials (uid, ticker, computedDate, prevClose, consensusPrice, pricePotentialRel, isStale) VALUES (?,?,?,?,?,?,?)",
+						(uid, ticker, computed_date, prev_close, consensus_price, potential, is_stale),
+					)
+					conn.commit()
+			except Exception as exc:  # noqa: BLE001
+				logging.debug("ComputePotentials: не удалось сохранить %s: %s", ticker, exc)
+	# Final prune if legacy
+	if store:
+		_prune_duplicates()
+	logging.info("ComputePotentials: завершено для %s бумаг (дата вычисления %s)", len(results), computed_date)
+	return results
+
+
+def export_potentials_to_excel(db_path: Path, filename: str = "potentials.xlsx") -> None:
+	with sqlite3.connect(db_path) as conn:
+		cur = conn.cursor()
+		# Проверим существует ли таблица
+		cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='instrument_potentials'")
+		if not cur.fetchone():
+			logging.warning("Экспорт potentials: таблица instrument_potentials отсутствует (создан пустой файл)")
+			rows = []
+			headers = ["uid","ticker","computedDate","prevClose","consensusPrice","pricePotentialRel","isStale"]
+		else:
+			# Новая схема без computedAt
+			cur.execute(
+				"""
+				SELECT uid, ticker, computedDate, prevClose, consensusPrice, pricePotentialRel, isStale
+				FROM instrument_potentials
+				ORDER BY computedDate DESC, ticker
+				"""
+			)
+			rows = cur.fetchall()
+			headers = [d[0] for d in cur.description]
+	wb = openpyxl.Workbook()
+	ws = wb.active
+	ws.title = "Potentials"
+	ws.append(headers)
+	for r in rows:
+		ws.append(list(r))
+	# Формат процента
+	try:
+		col_idx = headers.index("pricePotentialRel") + 1
+		from openpyxl.styles import numbers
+		for cell in ws.iter_cols(min_col=col_idx, max_col=col_idx, min_row=2):
+			for c in cell:
+				if isinstance(c.value, (int, float)) and c.value is not None:
+					c.number_format = '0.00%'
+	except ValueError:
+		pass
+	wb.save(filename)
+	logging.info("Экспорт potentials -> %s", filename)
+
+
+def RecomputePotentialForUid(db_path: Path, uid: str) -> None:
+	"""Пересчитать потенциал для одной бумаги (последний consensus + текущий prevClose).
+
+	Создаёт/обновляет запись instrument_potentials на текущую дату (computedDate).
+	"""
+	# Убедимся что таблица в мигрированном формате
+	with sqlite3.connect(db_path) as conn:
+		cur = conn.cursor()
+		cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='instrument_potentials'")
+		if not cur.fetchone():
+			conn.execute(
+				"""CREATE TABLE instrument_potentials (
+					uid TEXT,
+					ticker TEXT,
+					computedDate TEXT,
+					prevClose REAL,
+					consensusPrice REAL,
+					pricePotentialRel REAL,
+					isStale INTEGER DEFAULT 0,
+					PRIMARY KEY(uid, computedDate)
+				)"""
+			)
+			conn.execute("CREATE INDEX IF NOT EXISTS idx_instrument_potentials_rel ON instrument_potentials(pricePotentialRel)")
+			conn.commit()
+		else:
+			# При необходимости миграцию выполнит ComputePotentials (оставляем как есть)
+			cur.execute("PRAGMA table_info(instrument_potentials)")
+			cols = [r[1] for r in cur.fetchall()]
+	with sqlite3.connect(db_path) as conn:
+		cur = conn.cursor()
+		cur.execute("SELECT ticker, secid FROM perspective_shares WHERE uid=?", (uid,))
+		row = cur.fetchone()
+		if not row:
+			logging.debug("RecomputePotentialForUid: uid %s отсутствует в perspective_shares", uid)
+			return
+		ticker, secid = row
+		cur.execute(
+			"SELECT priceConsensus, recommendationDate FROM consensus_forecasts WHERE uid=? ORDER BY recommendationDate DESC LIMIT 1",
+			(uid,),
+		)
+		c_row = cur.fetchone()
+	if not c_row:
+		logging.debug("RecomputePotentialForUid: нет consensus для %s", uid)
+		return
+	cons_price, rec_date = c_row
+	prev_close, _dt = _get_prev_close(secid) if secid else (None, None)
+	potential = None
+	if cons_price is not None and prev_close is not None and isfinite(prev_close) and prev_close > 0:
+		potential = (cons_price - prev_close) / prev_close
+	is_stale = 0
+	if rec_date:
+		try:
+			rd = rec_date.rstrip('Z')
+			rd_dt = datetime.fromisoformat(rd.replace('Z', '+00:00'))
+			if rd_dt.tzinfo is None:
+				rd_dt = rd_dt.replace(tzinfo=timezone.utc)
+			if (datetime.now(timezone.utc) - rd_dt).days > 10:
+				is_stale = 1
+		except Exception:  # noqa: BLE001
+			pass
+	computed_date = _now_iso()[:10]
+	with sqlite3.connect(db_path) as conn:
+		conn.execute(
+			"INSERT OR REPLACE INTO instrument_potentials (uid, ticker, computedDate, prevClose, consensusPrice, pricePotentialRel, isStale) VALUES (?,?,?,?,?,?,?)",
+			(uid, ticker, computed_date, prev_close, cons_price, potential, is_stale),
+		)
+		conn.commit()
+	logging.info("RecomputePotentialForUid: %s (%s) потенциал= %s%% (дата %s)", ticker, uid, f"{potential*100:.2f}" if potential is not None else 'NULL', computed_date)
+
+
 # --- CLI ---------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-	parser = argparse.ArgumentParser(description="Инструменты работы с инвестиционными данными.")
+	parser = argparse.ArgumentParser(description="CLI-инструменты для управления списком бумаг и консенсус-прогнозами.")
 	parser.add_argument("--fill-start", action="store_true", help="заполнить таблицу perspective_shares стартовыми бумагами")
 	parser.add_argument("--fill-attributes", action="store_true", help="обновить отсутствующие атрибуты бумаг")
 	parser.add_argument("--add-share", metavar="QUERY", help="добавить новую бумагу по поисковой фразе")
+	parser.add_argument("--add-share-uid", metavar="UID", help="добавить бумагу напрямую по UID")
+	parser.add_argument("--add-share-figi", metavar="FIGI", help="добавить бумагу напрямую по FIGI")
+	parser.add_argument("--add-share-isin", metavar="ISIN", help="добавить бумагу напрямую по ISIN")
+	parser.add_argument(
+		"--search-dump",
+		metavar="QUERIES",
+		help="через запятую список поисковых фраз; выполнить FindInstrument (включая fallback) и сохранить результаты в search_results.json",
+	)
 	parser.add_argument("--export", nargs="?", const="perspective_shares.xlsx", metavar="FILENAME", help="экспортировать таблицу perspective_shares в Excel")
 	parser.add_argument(
 		"--export-consensus",
@@ -944,6 +1737,17 @@ def parse_args() -> argparse.Namespace:
 		metavar="DAYS",
 		help="удалять записи старше N дней (override CONSENSUS_MAX_HISTORY_DAYS, 0 или отрицательное — отключить возрастное удаление)",
 	)
+	parser.add_argument(
+		"--ensure-forecasts",
+		action="store_true",
+		help="проверить и дозагрузить прогнозы для бумаг, у которых нет ни одной записи (ручной запуск)",
+	)
+	parser.add_argument("--add-multiple", metavar="QUERIES", help="добавить несколько бумаг (через запятую или пробел)")
+	parser.add_argument("--update-prices", action="store_true", help="загрузить/обновить цены (скользящее окно) для перспективных бумаг")
+	parser.add_argument("--price-horizon", type=int, default=1100, help="горизонт (дней) для скользящего окна исторических цен (default 1100)")
+	parser.add_argument("--compute-potential", action="store_true", help="рассчитать потенциал (consensus vs последняя цена закрытия) и сохранить")
+	parser.add_argument("--export-potentials", nargs="?", const="potentials.xlsx", metavar="FILENAME", help="экспортировать таблицу instrument_potentials в Excel")
+	parser.add_argument("--stats", action="store_true", help="показать метрики и размеры таблиц")
 	return parser.parse_args()
 
 
@@ -962,6 +1766,43 @@ def main() -> None:
 
 	if args.add_share:
 		AddShareData(DB_PATH, args.add_share, TOKEN)
+
+	if getattr(args, 'add_multiple', None):
+		AddSharesBatch(DB_PATH, args.add_multiple, TOKEN)
+
+	if getattr(args, 'add_share_uid', None):
+		AddShareByIdentifier(DB_PATH, args.add_share_uid, 'UID', TOKEN)
+
+	if getattr(args, 'add_share_figi', None):
+		AddShareByIdentifier(DB_PATH, args.add_share_figi, 'FIGI', TOKEN)
+
+	if getattr(args, 'add_share_isin', None):
+		AddShareByIdentifier(DB_PATH, args.add_share_isin, 'ISIN', TOKEN)
+
+	# Отладочная опция: дамп результатов поиска по нескольким запросам
+	if getattr(args, "search_dump", None):
+		import json
+		queries = [q.strip() for q in args.search_dump.split(",") if q.strip()]
+		results: dict[str, list[dict]] = {}
+		for q in queries:
+			# Выполним тот же двойной поиск что и в GetUidInstrument, но сохраним сырые данные
+			payload_primary = {"query": q, "instrumentKind": "INSTRUMENT_TYPE_SHARE", "apiTradeAvailableFlag": True}
+			primary = _post(FIND_ENDPOINT, payload_primary, TOKEN) or {}
+			instruments = primary.get("instruments") or []
+			if not instruments:
+				payload_fb = {"query": q, "instrumentKind": "INSTRUMENT_TYPE_SHARE"}
+				fb = _post(FIND_ENDPOINT, payload_fb, TOKEN) or {}
+				instruments = fb.get("instruments") or []
+			results[q] = instruments
+		with open("search_results.json", "w", encoding="utf-8") as f:
+			json.dump(results, f, ensure_ascii=False, indent=2)
+		logging.info("Результаты поиска сохранены в search_results.json для запросов: %s", ", ".join(queries))
+
+	# После возможного добавления/обновления списка бумаг проверяем, что у всех есть прогнозы (если авто включено)
+	if is_auto_fetch_enabled():
+		EnsureForecastsForMissingShares(DB_PATH, TOKEN, prune=True)
+	else:
+		logging.debug("CONSENSUS_AUTO_FETCH=0 — пропуск EnsureForecastsForMissingShares при старте.")
 
 	if args.export:
 		export_perspective_shares_to_excel(DB_PATH, args.export)
@@ -988,14 +1829,92 @@ def main() -> None:
 			sleep_sec=(getattr(args, "fill_consensus_sleep", None) or 0.0),
 		)
 
+	if getattr(args, "ensure_forecasts", False):
+		EnsureForecastsForMissingShares(DB_PATH, TOKEN, prune=True)
+
+	if getattr(args, 'update_prices', False):
+		# Используем синхронный загрузчик с окном
+		from . import moex_history_4_perspective_shares as mh  # type: ignore
+		res = mh.daily_update_all(horizon_days=getattr(args, 'price_horizon', 1100), recompute_potentials=True)
+		logging.info("Цены обновлены: inserted=%s deleted_old=%s sec=%s", res.get('total_inserted'), res.get('total_deleted_old'), len(res.get('per_security', {})))
+		# После обновления потенциалы уже пересчитаны (recompute_potentials=True), выведем TOP-10
+		with sqlite3.connect(DB_PATH) as conn:
+			cur = conn.cursor()
+			try:
+				cur.execute(
+					"""
+					SELECT p.ticker, p.pricePotentialRel, p.isStale
+					FROM instrument_potentials p
+					JOIN (
+						SELECT uid, MAX(computedDate) AS maxd FROM instrument_potentials GROUP BY uid
+					) last ON last.uid = p.uid AND last.maxd = p.computedDate
+					WHERE p.pricePotentialRel IS NOT NULL
+					ORDER BY p.pricePotentialRel DESC
+					LIMIT 10
+					"""
+				)
+				rows = cur.fetchall()
+				if rows:
+					logging.info("Top-10 potentials после price update:")
+					for t, v, stale in rows:
+						logging.info("  %s: %.2f%% %s", t, v*100 if v is not None else float('nan'), '(STALE)' if stale else '')
+			except Exception as exc:  # noqa: BLE001
+				logging.debug("Top10 price update ошибка: %s", exc)
+
+	if getattr(args, 'compute_potential', False):
+		ComputePotentials(DB_PATH, store=True)
+
+	if getattr(args, 'export_potentials', None):
+		export_potentials_to_excel(DB_PATH, args.export_potentials)
+
+	if getattr(args, 'stats', False):
+		with sqlite3.connect(DB_PATH) as conn:
+			cur = conn.cursor()
+			for tbl in ("perspective_shares", "consensus_forecasts", "consensus_targets", "instrument_potentials"):
+				try:
+					cur.execute(f"SELECT COUNT(*) FROM {tbl}")
+					logging.info("%s: %s", tbl, cur.fetchone()[0])
+				except Exception:
+					logging.info("%s: (нет таблицы)", tbl)
+			# Топ-10 по потенциалу (только последняя вычисленная дата каждой бумаги)
+			try:
+				cur.execute(
+					"""
+					SELECT p.ticker, p.pricePotentialRel, p.isStale
+					FROM instrument_potentials p
+					JOIN (
+						SELECT uid, MAX(computedDate) AS maxd FROM instrument_potentials GROUP BY uid
+					) last ON last.uid = p.uid AND last.maxd = p.computedDate
+					WHERE p.pricePotentialRel IS NOT NULL
+					ORDER BY p.pricePotentialRel DESC
+					LIMIT 10
+					"""
+				)
+				rows = cur.fetchall()
+				if rows:
+					logging.info("Top-10 potentials (ticker: value% [stale]):")
+					for t, v, stale in rows:
+						logging.info("  %s: %.2f%% %s", t, v * 100 if v is not None else float('nan'), '(STALE)' if stale else '')
+			except Exception as exc:  # noqa: BLE001
+				logging.debug("Stats top-10 potentials error: %s", exc)
+		logging.info("METRICS: %s", METRICS)
+
 	if not any((
 		args.fill_start,
 		args.fill_attributes,
 		args.add_share,
+		getattr(args, 'add_multiple', None),
+		getattr(args, 'add_share_uid', None),
+		getattr(args, 'add_share_figi', None),
+		getattr(args, 'add_share_isin', None),
 		args.export,
 		args.export_consensus,
 		args.update_consensus,
 		args.fill_consensus,
+		getattr(args, 'load_moex_history', False),
+		getattr(args, 'compute_potential', False),
+		getattr(args, 'export_potentials', None),
+		getattr(args, 'stats', False),
 	)):
 		logging.info("База данных подготовлена. Дополнительные действия не выполнялись. Используйте --help для подсказки.")
 

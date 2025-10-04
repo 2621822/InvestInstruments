@@ -1,0 +1,1041 @@
+{
+  "instruments": [
+    {
+      "SECID": "ABIO",
+      "rows": 0
+    },
+    {
+      "SECID": "ABRD",
+      "rows": 0
+    },
+    {
+      "SECID": "AFKS",
+      "rows": 232
+    },
+    {
+      "SECID": "AFLT",
+      "rows": 0
+    },
+    {
+      "SECID": "AKFB",
+      "rows": 0
+    },
+    {
+      "SECID": "AKMB",
+      "rows": 0
+    },
+    {
+      "SECID": "AKMM",
+      "rows": 0
+    },
+    {
+      "SECID": "AKMP",
+      "rows": 0
+    },
+    {
+      "SECID": "AKRN",
+      "rows": 0
+    },
+    {
+      "SECID": "ALRS",
+      "rows": 232
+    },
+    {
+      "SECID": "AMFL",
+      "rows": 0
+    },
+    {
+      "SECID": "AMGB",
+      "rows": 0
+    },
+    {
+      "SECID": "AMNR",
+      "rows": 0
+    },
+    {
+      "SECID": "APRI",
+      "rows": 0
+    },
+    {
+      "SECID": "APTK",
+      "rows": 0
+    },
+    {
+      "SECID": "AQUA",
+      "rows": 0
+    },
+    {
+      "SECID": "ARSA",
+      "rows": 0
+    },
+    {
+      "SECID": "ASSB",
+      "rows": 0
+    },
+    {
+      "SECID": "ASTR",
+      "rows": 0
+    },
+    {
+      "SECID": "AVAN",
+      "rows": 0
+    },
+    {
+      "SECID": "BANE",
+      "rows": 0
+    },
+    {
+      "SECID": "BANEP",
+      "rows": 0
+    },
+    {
+      "SECID": "BELU",
+      "rows": 0
+    },
+    {
+      "SECID": "BISVP",
+      "rows": 0
+    },
+    {
+      "SECID": "BLNG",
+      "rows": 0
+    },
+    {
+      "SECID": "BRZL",
+      "rows": 0
+    },
+    {
+      "SECID": "BSPB",
+      "rows": 0
+    },
+    {
+      "SECID": "BSPBP",
+      "rows": 0
+    },
+    {
+      "SECID": "CARM",
+      "rows": 0
+    },
+    {
+      "SECID": "CBOM",
+      "rows": 0
+    },
+    {
+      "SECID": "CHGZ",
+      "rows": 0
+    },
+    {
+      "SECID": "CHKZ",
+      "rows": 0
+    },
+    {
+      "SECID": "CHMF",
+      "rows": 232
+    },
+    {
+      "SECID": "CHMK",
+      "rows": 0
+    },
+    {
+      "SECID": "CNRU",
+      "rows": 0
+    },
+    {
+      "SECID": "CNTL",
+      "rows": 0
+    },
+    {
+      "SECID": "CNTLP",
+      "rows": 0
+    },
+    {
+      "SECID": "DATA",
+      "rows": 0
+    },
+    {
+      "SECID": "DELI",
+      "rows": 0
+    },
+    {
+      "SECID": "DIAS",
+      "rows": 0
+    },
+    {
+      "SECID": "DIOD",
+      "rows": 0
+    },
+    {
+      "SECID": "DVEC",
+      "rows": 0
+    },
+    {
+      "SECID": "DZRD",
+      "rows": 0
+    },
+    {
+      "SECID": "DZRDP",
+      "rows": 0
+    },
+    {
+      "SECID": "EELT",
+      "rows": 0
+    },
+    {
+      "SECID": "ELFV",
+      "rows": 0
+    },
+    {
+      "SECID": "ELMT",
+      "rows": 0
+    },
+    {
+      "SECID": "ENPG",
+      "rows": 0
+    },
+    {
+      "SECID": "ETLN",
+      "rows": 0
+    },
+    {
+      "SECID": "EUTR",
+      "rows": 0
+    },
+    {
+      "SECID": "FEES",
+      "rows": 0
+    },
+    {
+      "SECID": "FESH",
+      "rows": 0
+    },
+    {
+      "SECID": "FIXR",
+      "rows": 0
+    },
+    {
+      "SECID": "FLOT",
+      "rows": 0
+    },
+    {
+      "SECID": "FMMM",
+      "rows": 0
+    },
+    {
+      "SECID": "GAZA",
+      "rows": 0
+    },
+    {
+      "SECID": "GAZAP",
+      "rows": 0
+    },
+    {
+      "SECID": "GAZP",
+      "rows": 232
+    },
+    {
+      "SECID": "GCHE",
+      "rows": 0
+    },
+    {
+      "SECID": "GECO",
+      "rows": 0
+    },
+    {
+      "SECID": "GEMC",
+      "rows": 0
+    },
+    {
+      "SECID": "GMKN",
+      "rows": 232
+    },
+    {
+      "SECID": "GTRK",
+      "rows": 0
+    },
+    {
+      "SECID": "HEAD",
+      "rows": 0
+    },
+    {
+      "SECID": "HIMCP",
+      "rows": 0
+    },
+    {
+      "SECID": "HNFG",
+      "rows": 0
+    },
+    {
+      "SECID": "HYDR",
+      "rows": 0
+    },
+    {
+      "SECID": "IGST",
+      "rows": 0
+    },
+    {
+      "SECID": "IGSTP",
+      "rows": 0
+    },
+    {
+      "SECID": "IRAO",
+      "rows": 0
+    },
+    {
+      "SECID": "IRKT",
+      "rows": 0
+    },
+    {
+      "SECID": "IVAT",
+      "rows": 0
+    },
+    {
+      "SECID": "JNOS",
+      "rows": 0
+    },
+    {
+      "SECID": "JNOSP",
+      "rows": 0
+    },
+    {
+      "SECID": "KAZT",
+      "rows": 0
+    },
+    {
+      "SECID": "KAZTP",
+      "rows": 0
+    },
+    {
+      "SECID": "KBSB",
+      "rows": 0
+    },
+    {
+      "SECID": "KCHE",
+      "rows": 0
+    },
+    {
+      "SECID": "KCHEP",
+      "rows": 0
+    },
+    {
+      "SECID": "KFBA",
+      "rows": 0
+    },
+    {
+      "SECID": "KGKC",
+      "rows": 0
+    },
+    {
+      "SECID": "KGKCP",
+      "rows": 0
+    },
+    {
+      "SECID": "KLSB",
+      "rows": 0
+    },
+    {
+      "SECID": "KLVZ",
+      "rows": 0
+    },
+    {
+      "SECID": "KMAZ",
+      "rows": 0
+    },
+    {
+      "SECID": "KMEZ",
+      "rows": 0
+    },
+    {
+      "SECID": "KOGK",
+      "rows": 0
+    },
+    {
+      "SECID": "KRKN",
+      "rows": 0
+    },
+    {
+      "SECID": "KRKNP",
+      "rows": 0
+    },
+    {
+      "SECID": "KRKOP",
+      "rows": 0
+    },
+    {
+      "SECID": "KROT",
+      "rows": 0
+    },
+    {
+      "SECID": "KROTP",
+      "rows": 0
+    },
+    {
+      "SECID": "KRSB",
+      "rows": 0
+    },
+    {
+      "SECID": "KRSBP",
+      "rows": 0
+    },
+    {
+      "SECID": "KUZB",
+      "rows": 0
+    },
+    {
+      "SECID": "KZOS",
+      "rows": 0
+    },
+    {
+      "SECID": "KZOSP",
+      "rows": 0
+    },
+    {
+      "SECID": "LEAS",
+      "rows": 0
+    },
+    {
+      "SECID": "LENT",
+      "rows": 0
+    },
+    {
+      "SECID": "LIFE",
+      "rows": 0
+    },
+    {
+      "SECID": "LKOH",
+      "rows": 232
+    },
+    {
+      "SECID": "LMBZ",
+      "rows": 0
+    },
+    {
+      "SECID": "LNZL",
+      "rows": 0
+    },
+    {
+      "SECID": "LNZLP",
+      "rows": 0
+    },
+    {
+      "SECID": "LPSB",
+      "rows": 0
+    },
+    {
+      "SECID": "LQDT",
+      "rows": 0
+    },
+    {
+      "SECID": "LSNG",
+      "rows": 0
+    },
+    {
+      "SECID": "LSNGP",
+      "rows": 0
+    },
+    {
+      "SECID": "LSRG",
+      "rows": 0
+    },
+    {
+      "SECID": "LVHK",
+      "rows": 0
+    },
+    {
+      "SECID": "MAGE",
+      "rows": 0
+    },
+    {
+      "SECID": "MAGEP",
+      "rows": 0
+    },
+    {
+      "SECID": "MAGN",
+      "rows": 0
+    },
+    {
+      "SECID": "MBNK",
+      "rows": 0
+    },
+    {
+      "SECID": "MDMG",
+      "rows": 0
+    },
+    {
+      "SECID": "MFGS",
+      "rows": 0
+    },
+    {
+      "SECID": "MFGSP",
+      "rows": 0
+    },
+    {
+      "SECID": "MGKL",
+      "rows": 0
+    },
+    {
+      "SECID": "MGNT",
+      "rows": 232
+    },
+    {
+      "SECID": "MGTS",
+      "rows": 0
+    },
+    {
+      "SECID": "MGTSP",
+      "rows": 0
+    },
+    {
+      "SECID": "MISB",
+      "rows": 0
+    },
+    {
+      "SECID": "MISBP",
+      "rows": 0
+    },
+    {
+      "SECID": "MOEX",
+      "rows": 232
+    },
+    {
+      "SECID": "MRKC",
+      "rows": 0
+    },
+    {
+      "SECID": "MRKK",
+      "rows": 0
+    },
+    {
+      "SECID": "MRKP",
+      "rows": 0
+    },
+    {
+      "SECID": "MRKS",
+      "rows": 0
+    },
+    {
+      "SECID": "MRKU",
+      "rows": 0
+    },
+    {
+      "SECID": "MRKV",
+      "rows": 0
+    },
+    {
+      "SECID": "MRKY",
+      "rows": 0
+    },
+    {
+      "SECID": "MRKZ",
+      "rows": 0
+    },
+    {
+      "SECID": "MRSB",
+      "rows": 0
+    },
+    {
+      "SECID": "MSNG",
+      "rows": 0
+    },
+    {
+      "SECID": "MSRS",
+      "rows": 0
+    },
+    {
+      "SECID": "MSTT",
+      "rows": 0
+    },
+    {
+      "SECID": "MTLR",
+      "rows": 0
+    },
+    {
+      "SECID": "MTLRP",
+      "rows": 0
+    },
+    {
+      "SECID": "MTSS",
+      "rows": 232
+    },
+    {
+      "SECID": "MVID",
+      "rows": 0
+    },
+    {
+      "SECID": "NFAZ",
+      "rows": 951
+    },
+    {
+      "SECID": "NKHP",
+      "rows": 951
+    },
+    {
+      "SECID": "NKNC",
+      "rows": 951
+    },
+    {
+      "SECID": "NKNCP",
+      "rows": 951
+    },
+    {
+      "SECID": "NKSH",
+      "rows": 951
+    },
+    {
+      "SECID": "NLMK",
+      "rows": 951
+    },
+    {
+      "SECID": "NMTP",
+      "rows": 951
+    },
+    {
+      "SECID": "NNSB",
+      "rows": 951
+    },
+    {
+      "SECID": "NNSBP",
+      "rows": 951
+    },
+    {
+      "SECID": "NSVZ",
+      "rows": 951
+    },
+    {
+      "SECID": "NVTK",
+      "rows": 232
+    },
+    {
+      "SECID": "OGKB",
+      "rows": 951
+    },
+    {
+      "SECID": "OMZZP",
+      "rows": 951
+    },
+    {
+      "SECID": "OZPH",
+      "rows": 243
+    },
+    {
+      "SECID": "PAZA",
+      "rows": 741
+    },
+    {
+      "SECID": "PHOR",
+      "rows": 232
+    },
+    {
+      "SECID": "PIKK",
+      "rows": 232
+    },
+    {
+      "SECID": "PLZL",
+      "rows": 232
+    },
+    {
+      "SECID": "PMSB",
+      "rows": 951
+    },
+    {
+      "SECID": "PMSBP",
+      "rows": 951
+    },
+    {
+      "SECID": "POSI",
+      "rows": 951
+    },
+    {
+      "SECID": "PRFN",
+      "rows": 563
+    },
+    {
+      "SECID": "PRMB",
+      "rows": 951
+    },
+    {
+      "SECID": "PRMD",
+      "rows": 312
+    },
+    {
+      "SECID": "PSMM",
+      "rows": 0
+    },
+    {
+      "SECID": "RAGR",
+      "rows": 159
+    },
+    {
+      "SECID": "RASP",
+      "rows": 951
+    },
+    {
+      "SECID": "RBCM",
+      "rows": 856
+    },
+    {
+      "SECID": "RDRB",
+      "rows": 951
+    },
+    {
+      "SECID": "RENI",
+      "rows": 951
+    },
+    {
+      "SECID": "RGSS",
+      "rows": 951
+    },
+    {
+      "SECID": "RKKE",
+      "rows": 951
+    },
+    {
+      "SECID": "RNFT",
+      "rows": 951
+    },
+    {
+      "SECID": "ROLO",
+      "rows": 951
+    },
+    {
+      "SECID": "ROSN",
+      "rows": 232
+    },
+    {
+      "SECID": "ROST",
+      "rows": 951
+    },
+    {
+      "SECID": "RTGZ",
+      "rows": 951
+    },
+    {
+      "SECID": "RTKM",
+      "rows": 951
+    },
+    {
+      "SECID": "RTKMP",
+      "rows": 951
+    },
+    {
+      "SECID": "RTSB",
+      "rows": 951
+    },
+    {
+      "SECID": "RTSBP",
+      "rows": 951
+    },
+    {
+      "SECID": "RUAL",
+      "rows": 951
+    },
+    {
+      "SECID": "RUSI",
+      "rows": 951
+    },
+    {
+      "SECID": "RZSB",
+      "rows": 951
+    },
+    {
+      "SECID": "SAGO",
+      "rows": 951
+    },
+    {
+      "SECID": "SAGOP",
+      "rows": 951
+    },
+    {
+      "SECID": "SARE",
+      "rows": 951
+    },
+    {
+      "SECID": "SAREP",
+      "rows": 951
+    },
+    {
+      "SECID": "SBER",
+      "rows": 232
+    },
+    {
+      "SECID": "SBERP",
+      "rows": 232
+    },
+    {
+      "SECID": "SELG",
+      "rows": 951
+    },
+    {
+      "SECID": "SFIN",
+      "rows": 951
+    },
+    {
+      "SECID": "SGZH",
+      "rows": 951
+    },
+    {
+      "SECID": "SIBN",
+      "rows": 951
+    },
+    {
+      "SECID": "SLEN",
+      "rows": 951
+    },
+    {
+      "SECID": "SMLT",
+      "rows": 951
+    },
+    {
+      "SECID": "SNGS",
+      "rows": 232
+    },
+    {
+      "SECID": "SNGSP",
+      "rows": 232
+    },
+    {
+      "SECID": "SOFL",
+      "rows": 515
+    },
+    {
+      "SECID": "SPBE",
+      "rows": 951
+    },
+    {
+      "SECID": "STSB",
+      "rows": 951
+    },
+    {
+      "SECID": "STSBP",
+      "rows": 951
+    },
+    {
+      "SECID": "SVAV",
+      "rows": 951
+    },
+    {
+      "SECID": "SVCB",
+      "rows": 456
+    },
+    {
+      "SECID": "SVET",
+      "rows": 951
+    },
+    {
+      "SECID": "SVETP",
+      "rows": 345
+    },
+    {
+      "SECID": "T",
+      "rows": 213
+    },
+    {
+      "SECID": "TASB",
+      "rows": 951
+    },
+    {
+      "SECID": "TASBP",
+      "rows": 951
+    },
+    {
+      "SECID": "TATN",
+      "rows": 232
+    },
+    {
+      "SECID": "TATNP",
+      "rows": 951
+    },
+    {
+      "SECID": "TGKA",
+      "rows": 951
+    },
+    {
+      "SECID": "TGKB",
+      "rows": 951
+    },
+    {
+      "SECID": "TGKBP",
+      "rows": 951
+    },
+    {
+      "SECID": "TGKN",
+      "rows": 951
+    },
+    {
+      "SECID": "TNSE",
+      "rows": 951
+    },
+    {
+      "SECID": "TORS",
+      "rows": 951
+    },
+    {
+      "SECID": "TORSP",
+      "rows": 951
+    },
+    {
+      "SECID": "TRMK",
+      "rows": 951
+    },
+    {
+      "SECID": "TRNFP",
+      "rows": 951
+    },
+    {
+      "SECID": "TTLK",
+      "rows": 951
+    },
+    {
+      "SECID": "TUZA",
+      "rows": 951
+    },
+    {
+      "SECID": "UGLD",
+      "rows": 473
+    },
+    {
+      "SECID": "UKUZ",
+      "rows": 951
+    },
+    {
+      "SECID": "UNAC",
+      "rows": 951
+    },
+    {
+      "SECID": "UNKL",
+      "rows": 951
+    },
+    {
+      "SECID": "UPRO",
+      "rows": 951
+    },
+    {
+      "SECID": "URKZ",
+      "rows": 951
+    },
+    {
+      "SECID": "USBN",
+      "rows": 951
+    },
+    {
+      "SECID": "UTAR",
+      "rows": 951
+    },
+    {
+      "SECID": "UWGN",
+      "rows": 206
+    },
+    {
+      "SECID": "VGSB",
+      "rows": 951
+    },
+    {
+      "SECID": "VGSBP",
+      "rows": 951
+    },
+    {
+      "SECID": "VJGZ",
+      "rows": 951
+    },
+    {
+      "SECID": "VJGZP",
+      "rows": 951
+    },
+    {
+      "SECID": "VKCO",
+      "rows": 951
+    },
+    {
+      "SECID": "VLHZ",
+      "rows": 951
+    },
+    {
+      "SECID": "VRSB",
+      "rows": 951
+    },
+    {
+      "SECID": "VRSBP",
+      "rows": 951
+    },
+    {
+      "SECID": "VSEH",
+      "rows": 317
+    },
+    {
+      "SECID": "VSMO",
+      "rows": 951
+    },
+    {
+      "SECID": "VSYD",
+      "rows": 951
+    },
+    {
+      "SECID": "VSYDP",
+      "rows": 951
+    },
+    {
+      "SECID": "VTBR",
+      "rows": 951
+    },
+    {
+      "SECID": "WTCM",
+      "rows": 951
+    },
+    {
+      "SECID": "WTCMP",
+      "rows": 951
+    },
+    {
+      "SECID": "WUSH",
+      "rows": 712
+    },
+    {
+      "SECID": "X5",
+      "rows": 186
+    },
+    {
+      "SECID": "YAKG",
+      "rows": 951
+    },
+    {
+      "SECID": "YKEN",
+      "rows": 951
+    },
+    {
+      "SECID": "YKENP",
+      "rows": 951
+    },
+    {
+      "SECID": "YRSB",
+      "rows": 951
+    },
+    {
+      "SECID": "YRSBP",
+      "rows": 951
+    },
+    {
+      "SECID": "ZAYM",
+      "rows": 375
+    },
+    {
+      "SECID": "ZILL",
+      "rows": 951
+    },
+    {
+      "SECID": "ZVEZ",
+      "rows": 951
+    }
+  ],
+  "total_instruments": 256,
+  "total_rows": 95719,
+  "http_requests": 1808,
+  "cache_hits": 0,
+  "retries": 0,
+  "pages_fetched": 0,
+  "duration_sec": 388.839,
+  "dry_run": false,
+  "rate_limit": 5.0,
+  "step_days": 100,
+  "since": null,
+  "days": null,
+  "to_date": "2025-10-01"
+}

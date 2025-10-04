@@ -1,185 +1,165 @@
-# Investment Instruments CLI
+# Инструменты для данных MOEX и консенсус‑прогнозов
 
-Utilities for managing a local SQLite database with perspective shares, consensus forecasts, and analyst targets fetched from the Tinkoff Invest public API.
+Минимальный набор утилит для локальной SQLite‑БД `GorbunovInvestInstruments.db`:
+1. Синхронная загрузка и поддержание исторических цен MOEX (скользящее окно ~1100 дней, очистка старых строк).
+2. Получение и обновление консенсус‑прогнозов и целей аналитиков через публичный API Тинькофф.
+3. Расчёт потенциалов (daily уникальность по `(uid, computedDate)`).
+4. Экспорт потенциалов в Excel / JSON.
+5. Оркестрация единым скриптом `full_refresh.py`.
 
-## Prerequisites
+## Требования
 
 - Python 3.11+
-- Dependencies listed in `GorbunovInvestInstruments/main.py` (`requests`, `urllib3`, `openpyxl`)
+- Зависимости перечислены в `requirements.txt`
 
-Install dependencies once:
+Установка зависимостей:
 
 ```
 pip install -r requirements.txt
 ```
 
-or, if you prefer not to use a requirements file:
+## Быстрый старт (полный цикл)
 
-```
-pip install requests urllib3 openpyxl
-```
-
-## Usage (Tinkoff + Consensus)
-
-All commands are executed from the project root with PowerShell:
-
-```
-python GorbunovInvestInstruments/main.py [options]
+```powershell
+python full_refresh.py
 ```
 
-Available options:
+Скрипт выполнит (пошагово):
+1. Проверка и догрузка отсутствующих историй цен (скользящее окно).
+2. Инкрементальное обновление цен за последние дни.
+3. Загрузка/дозагрузка консенсус‑прогнозов (если есть токен).
+4. Пересчёт потенциалов.
+5. Экспорт (Excel всегда, JSON опционально через переменную окружения).
 
-| Option | Description |
-| --- | --- |
-| `--fill-start` | Populate `perspective_shares` with the starter watchlist (id/name pairs). |
-| `--fill-attributes` | Enrich every share in `perspective_shares` with ticker, FIGI, ISIN, etc. |
-| `--add-share "QUERY"` | Find a share by name/ticker and append it to the watchlist. |
-| `--export [FILENAME]` | Export the current watchlist to Excel (default `perspective_shares.xlsx`). |
-| `--export-consensus [FILENAME]` | Export both consensus tables to an Excel workbook (default `consensus_data.xlsx`). |
-| `--update-consensus [UID]` | Fetch consensus forecast and analyst targets for all shares or for the provided UID only (with pruning of historical depth afterwards). |
-| `--fill-consensus` | One-time (or ad‑hoc) bulk initial load of consensus + analyst targets for all shares (no pruning). |
-| `--fill-consensus-limit N` | Limit number of instruments processed during `--fill-consensus` (useful for testing). |
-| `--fill-consensus-sleep SEC` | Add delay (seconds, can be fractional) between API calls during `--fill-consensus`. |
-| `--max-consensus N` | Override max stored consensus rows per instrument (default / env). |
-| `--max-targets-per-analyst N` | Override max analyst target rows per (uid, company). |
-| `--max-history-days DAYS` | Override age pruning threshold in days (0 disables age pruning). |
+Токен берётся из переменной окружения `TINKOFF_INVEST_TOKEN`, если отсутствует — из файла `tinkoff_token.txt` (первая непустая строка). Полный токен в логе не выводится (маскируется).
 
-Examples:
+Автоматизированные скрипты:
+- Windows BAT: `run_full_refresh.bat` (создание venv, зависимости, лог ротация `refresh_YYYYMMDD.log`).
+- PowerShell: `full_refresh.ps1` (доп. параметры `-ShowLogTail`, `-ForceInstall`, `-AllowInsecure`).
 
-- Initialize the database and fill it with starter tickers:
+### Переменные окружения для full_refresh
 
-	```
-	python GorbunovInvestInstruments/main.py --fill-start --fill-attributes
-	```
-
-- Update consensus data for all tracked shares:
-
-	```
-	python GorbunovInvestInstruments/main.py --update-consensus
-	```
-
-- Perform initial consensus load without pruning (first populate history):
-
-	```
-	python GorbunovInvestInstruments/main.py --fill-consensus
-	```
-
-- Test initial load only for first 3 instruments with 0.3s pause:
-
-	```
-	python GorbunovInvestInstruments/main.py --fill-consensus --fill-consensus-limit 3 --fill-consensus-sleep 0.3
-	```
-
-- Export consensus forecasts and analyst targets:
-
-	```
-	python GorbunovInvestInstruments/main.py --export-consensus
-	```
-
-- Update consensus only for a specific UID:
-
-	```
-	python GorbunovInvestInstruments/main.py --update-consensus 7de75794-a27f-4d81-a39b-492345813822
-	```
-
-The script logs confirmations for every write operation and skips duplicates based on the latest stored values.
-
-### Update vs Fill Consensus
-
-- `--fill-consensus` is intended for initial accumulation of current consensus snapshots; it does NOT prune history afterwards.
-- `--update-consensus` is for regular (e.g. daily) refreshes and will prune history according to limits:
-	- Max consensus rows per instrument: 300
-	- Max analyst target rows per (uid, company): 100
-	- Optional age-based pruning of rows older than 1000 days.
-
-You can override the API token by setting environment variable `TINKOFF_INVEST_TOKEN`. If not set, a built-in default token is used (not recommended for prolonged production usage).
-
-### Environment Variables
-
-| Variable | Purpose | Default |
+| Переменная | Назначение | По умолчанию |
 | --- | --- | --- |
-| `TINKOFF_INVEST_TOKEN` | Auth token for API requests | (required, none) |
-| `API_TIMEOUT` | Per-request timeout (seconds) | 15 |
-| `API_MAX_ATTEMPTS` | Max retry attempts for network/5xx errors | 3 |
-| `API_BACKOFF_BASE` | Base backoff (seconds), grows exponentially | 0.5 |
-| `APP_LOG_LEVEL` | Logging level (INFO/DEBUG/...) | INFO |
-| `APP_LOG_FILE` | Log file name for rotating logs | app.log |
-| `APP_DISABLE_SSL_VERIFY` | Set to 1 to disable TLS verification (dev only) | 0 |
-| `CONSENSUS_MAX_PER_UID` | Max consensus rows per uid (CLI override: --max-consensus) | 300 |
-| `CONSENSUS_MAX_TARGETS_PER_ANALYST` | Max target rows per (uid, company) (CLI override) | 100 |
-| `CONSENSUS_MAX_HISTORY_DAYS` | Age pruning threshold days (CLI override: --max-history-days) | 1000 |
+| `TINKOFF_INVEST_TOKEN` | Токен API Тинькофф | (читается из файла если не задан) |
+| `FULL_REFRESH_EXPORT_JSON` | 1 = сохранять JSON экспорт потенциалов | 0 |
+| `FULL_REFRESH_EXCEL_NAME` | Имя Excel файла | potentials_export.xlsx |
+| `FULL_REFRESH_JSON_NAME` | Имя JSON файла (если включён) | potentials_export.json |
+| `PRICE_LIMIT_INSTRUMENTS` | Ограничить число бумаг при загрузке цен | (нет) |
+| `PRICE_GLOBAL_TIMEOUT_SEC` | Прервать загрузку цен по тайм‑ауту | (нет) |
+| `TINKOFF_CA_BUNDLE` | Путь к кастомному CA bundle (SSL) | (системный) |
+| `TINKOFF_SSL_NO_VERIFY` | 1 = отключить проверку TLS (диагностика) | 0 |
+
+### Диагностика SSL проблем
+При ошибке вида `CERTIFICATE_VERIFY_FAILED`:
+1. (Временно) проверить, работает ли с отключением: `$env:TINKOFF_SSL_NO_VERIFY='1'; python full_refresh.py`
+2. Извлечь корневой сертификат(ы) в PEM: поместите файл `tinkoff_ca_bundle.pem` (приоритет) или `corp_ca.pem` в корень — скрипты подхватят автоматически.
+3. Либо указать путь явно: `$env:TINKOFF_CA_BUNDLE='D:\certs\corp_ca.pem'`.
+4. Удалить переменную `TINKOFF_SSL_NO_VERIFY` после диагностики.
+
+Отключение проверки SSL (не для продакшена):
+- Переменная окружения: `TINKOFF_SSL_NO_VERIFY=1`
+- PowerShell флаг: `./full_refresh.ps1 -AllowInsecure`
+- Файл-флаг в корне: `disable_ssl_verify.flag` (создайте пустой файл — оба скрипта отключат проверку)
+
+Всегда удаляйте/убирайте эти механизмы после выяснения причин проблемы.
+
+### Экспорт
+Excel содержит «умную» таблицу с подсветкой стилей; JSON (если включён) повторяет набор данных.
+
+### Потенциалы
+`potentials.compute_all` формирует/обновляет таблицу с ключом `(uid, computedDate)` и относительным потенциалом на основе последней доступной цены (`CLOSE`) из `moex_history_perspective_shares` и consensus target/consensus price (формула упрощена в коде). Старый столбец `computedAt` удалён для дедупликации.
+
+### Планирование (Windows Task Scheduler)
+Используйте `run_full_refresh.bat` или PowerShell вариант:
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File full_refresh.ps1 -ShowLogTail
+```
+Задайте ежедневный триггер. Логи: `refresh_YYYYMMDD.log`.
+
+### Разница: update vs fill
+
+- `--fill-consensus` — первоначальное накопление данных (история не чистится).
+- `--update-consensus` — регулярное обновление с обрезкой: максимум 300 consensus и 100 target записей + возрастной порог (числа настраиваются переменными окружения / флагами CLI).
+
+### Переменные окружения (консенсус)
+
+| Переменная | Назначение | Значение по умолчанию |
+| --- | --- | --- |
+| `TINKOFF_INVEST_TOKEN` | Токен авторизации API | (нет, требуется) |
+| `API_TIMEOUT` | Таймаут запроса (сек) | 15 |
+| `API_MAX_ATTEMPTS` | Повторных попыток при ошибках | 3 |
+| `API_BACKOFF_BASE` | Базовый backoff (сек) | 0.5 |
+| `APP_LOG_LEVEL` | Уровень логирования | INFO |
+| `APP_LOG_FILE` | Имя лог-файла | app.log |
+| `APP_DISABLE_SSL_VERIFY` | 1 = отключить проверку TLS (dev) | 0 |
+| `CONSENSUS_MAX_PER_UID` | Лимит consensus записей на uid | 300 |
+| `CONSENSUS_MAX_TARGETS_PER_ANALYST` | Лимит целей на (uid, company) | 100 |
+| `CONSENSUS_MAX_HISTORY_DAYS` | Порог дней для возрастной очистки | 1000 |
+| `CONSENSUS_AUTO_FETCH` | 1=авто дозагрузка при старте и добавлении новой бумаги | 1 |
 
 ---
 
-## Async MOEX History Loader
+## Исторические цены MOEX
+Реализованы в модуле `GorbunovInvestInstruments/data_prices.py`:
+- Таблица `moex_history_perspective_shares`
+- Пагинация ISS (`start` параметр)
+- Скользящее окно (удаление записей старше горизонта)
+- Инкрементальная догрузка
+- Ограничение по времени/количеству бумаг через `PRICE_LIMIT_INSTRUMENTS`, `PRICE_GLOBAL_TIMEOUT_SEC`
 
-File: `moex.py` — асинхронная утилита загрузки исторических данных с ISS MOEX.
+### Источник цен для потенциалов
+Берётся последняя `CLOSE` на дату пересчёта. При каждом полном обновлении выполняется `compute_all`.
 
-Features:
-- Incremental updates: starts from last stored TRADEDATE+1 per (BOARDID, SECID)
-- Override start date with `--since` or sliding window with `--days`
-- Batching by date ranges (`--step-days`)
-- Bounded concurrency (`--max-concurrency`)
-- Retries with exponential backoff
-- Optional JSON / Excel exports
-- Automatic pagination of ISS history endpoint if result spans multiple pages
+## Планировщик (Windows Task Scheduler)
 
-### Basic Run
+Для ежедневного обновления (например, в 08:30):
+1. Откройте Планировщик заданий -> Создать задачу.
+2. Триггер: Ежедневно, время 08:30.
+3. Действие: Запустить программу.
+  - Программа/скрипт: `python`
+  - Аргументы: `full_refresh.py`
+  - Рабочая папка: путь к каталогу проекта.
+4. Вкладка «Условия»: при необходимости снять галочку «Запускать только при питании от сети».
+5. Вкладка «Параметры»: включить «Запустить задачу как можно скорее после пропуска». 
 
+Логи пишутся в `app.log`. При необходимости можно задать перенаправление вывода в файл .bat:
 ```
-python moex.py --instruments SBER GAZP LKOH
-```
-
-### Options
-
-| Option | Description |
-| --- | --- |
-| `--instruments SECID...` | Limit to specific SECIDs (otherwise all from `share` table in `moex_data.db`). |
-| `--to-date YYYY-MM-DD` | Upper bound date (default = today). |
-| `--since YYYY-MM-DD` | Force absolute start date (highest precedence). |
-| `--days N` | Load only last N days (ignored if `--since` provided). |
-| `--step-days N` | Date batch size (default from env `MOEX_DATE_STEP`, default 100). |
-| `--max-concurrency N` | Parallel fetch limit (env `MOEX_MAX_CONCURRENCY`, default 8). |
-| `--export [FILE]` | Export combined fetched data to Excel (default `moex_data.xlsx`). |
-| `--export-json [FILE]` | Export fetched data to JSON (default `moex_data.json`). |
-| `--dry-run` | Fetch & build export only, do not write to DB. |
-| `--rate-limit RPS` | Limit requests per second (token bucket). |
-| `--cache-dir PATH` | Directory for response file cache. |
-| `--summary-json FILE` | Write run metrics summary to JSON. |
-| `--log-level LEVEL` | Logging level. |
-
-### Environment Variables (MOEX)
-
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `MOEX_DB_PATH` | SQLite path for MOEX data | `moex_data.db` |
-| `MOEX_DATE_STEP` | Default batch size (days) | 100 |
-| `MOEX_MAX_CONCURRENCY` | Max simultaneous HTTP requests | 8 |
-| `MOEX_HTTP_TIMEOUT` | Per-request timeout seconds | 20 |
-| `MOEX_HTTP_RETRIES` | Retry attempts | 3 |
-| `MOEX_HTTP_BACKOFF` | Base seconds for exp. backoff | 0.5 |
-| `MOEX_RATE_LIMIT` | Requests per second limit (0=disabled) | 0 |
-| `MOEX_CACHE_DIR` | Directory for response cache | (none) |
-| `MOEX_SUMMARY_JSON` | Path for metrics summary JSON | (none) |
-
-### Example: Last 30 Days Only
-
-```
-python moex.py --instruments SBER GAZP --days 30
+python full_refresh.py >> refresh.log 2>&1
 ```
 
-### Example: Force Fresh Load From Fixed Date
+### Структура таблицы `moex_history_perspective_shares`
 
+Хранит необходимые поля ответа ISS (BOARDID, SECID, TRADEDATE, CLOSE, VOLUME и др.) + дублирует дату в `TRADE_SESSION_DATE`.
+Ключ не навязан средствами UNIQUE — дубликаты избегаются логикой вставки `WHERE NOT EXISTS`.
+
+### Метрики
+
+Возвращаемая структура при пакетном обновлении содержит:
 ```
-python moex.py --instruments SBER --since 2024-01-01 --export-json sber_2024.json
+{
+  "total_inserted": N,
+  "total_deleted_old": M,
+  "http_requests": X,
+  "retries": R,
+  "per_security": { "SBER": {"inserted": ..., "deleted_old": ...}, ... }
+}
 ```
 
-Precedence of start date: --since > --days > incremental-from-last > default(2022-01-01)
+### Тестирование
+
+Добавлен модульный тест `test_prev_close.py`, который проверяет извлечение последней цены из новой таблицы.
 
 ---
 
-Disabling SSL verification (`APP_DISABLE_SSL_VERIFY=1`) is strongly discouraged outside of local debugging.
+## Пример запуска hello.py
 
-## Legacy Hello World
+Артефакт примера `hello.py` оставлен для совместимости:
 
-The original tutorial artifact `hello.py` is still present and can be run with `python hello.py`.
+```
+python hello.py
+```
+
+---
+
+Все сообщения логирования и комментарии локализованы на русский язык. Модули, связанные с legacy (web UI / async), удалены.

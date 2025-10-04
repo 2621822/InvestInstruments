@@ -2,7 +2,7 @@ import asyncio
 import datetime as dt
 import pytest
 
-from moex import get_date_ranges, resolve_start_date, RateLimiter, START_DATE
+from GorbunovInvestInstruments.moex_utils import get_date_ranges, resolve_start_date, RateLimiter, START_DATE
 
 class DummyArgs:
     def __init__(self, to_date=None, since=None, days=None):

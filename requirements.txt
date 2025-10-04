@@ -5,3 +5,7 @@ aiohttp
 pandas
 pytest
 pytest-asyncio
+numpy
+fastapi[test]
+uvicorn
+jinja2
