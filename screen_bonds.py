@@ -1,0 +1,263 @@
+"""screen_bonds.py
+
+Скрипт:
+ 1. Загружает список облигаций с выбранных досок MOEX (по умолчанию корпоративные TQOB и офз TQCB/TQIR при желании).
+ 2. Сохраняет сырые данные в таблицу moex_bonds_raw (upsert по SECID+BOARDID).
+ 3. Отбирает облигации, торгующиеся на 20% и более ниже номинала (PREVPRICE <= 80) И с годовой доходностью >= 20% (YIELD >= 20).
+ 4. Группирует результат по группам рейтингов эмитента (issuer_ratings.rating_group). Если рейтинга нет — группа 'UNSPECIFIED'.
+
+Примечания:
+ - Для облигаций на MOEX поле PREVPRICE выражено в процентах от номинала, поэтому сравнение PREVPRICE <= 80 эквивалентно «ниже номинала >=20%».
+ - Поле YIELD (или YIELDCLOSE) — доходность к погашению, % годовых (берём YIELD, если есть; fallback YIELDCLOSE).
+ - Источник рейтингов не предоставлен; создаётся вспомогательная таблица issuer_ratings(issuer TEXT PRIMARY KEY, rating_group TEXT). Заполните её вручную для более осмысленной группировки.
+
+Запуск:
+  python screen_bonds.py
+
+Параметры окружения:
+  BONDS_BOARDS=TQOB,TQCB  (список досок, запятая)
+  BONDS_MIN_YIELD=20
+  BONDS_MAX_PRICE_PCT=80   (максимальный PREVPRICE, чтобы считалось 20% ниже номинала)
+  BONDS_EXPORT_CSV=1       (экспорт результата в bonds_screen.csv)
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sqlite3
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List
+
+import requests
+
+DB_PATH = Path("GorbunovInvestInstruments.db")
+ISS_BASE = "https://iss.moex.com/iss"
+
+DEFAULT_BOARDS = ["TQOB"]  # корпоративные облигации основная доска. Можно добавить TQCB (офз?) при необходимости.
+
+@dataclass
+class BondRow:
+    secid: str
+    boardid: str
+    shortname: str | None
+    secname: str | None
+    isin: str | None
+    facevalue: float | None
+    prevprice: float | None
+    yield_pct: float | None
+    matdate: str | None
+    couponvalue: float | None
+    couponpercent: float | None
+    issuer: str | None
+
+
+def setup_logging() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+
+def ensure_tables() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS moex_bonds_raw (
+                    secid TEXT,
+                    boardid TEXT,
+                    shortname TEXT,
+                    secname TEXT,
+                    isin TEXT,
+                    facevalue REAL,
+                    prevprice REAL,
+                    yield_pct REAL,
+                    matdate TEXT,
+                    couponvalue REAL,
+                    couponpercent REAL,
+                    issuer TEXT,
+                    updatedAt TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (secid, boardid)
+            )"""
+        )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS issuer_ratings (
+                    issuer TEXT PRIMARY KEY,
+                    rating_group TEXT
+            )"""
+        )
+        conn.commit()
+
+
+def fetch_board(board: str) -> List[BondRow]:
+    url = f"{ISS_BASE}/engines/stock/markets/bonds/boards/{board}/securities.json"
+    params = {"iss.meta": "off"}
+    try:
+        resp = requests.get(url, params=params, timeout=20)
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Не удалось получить данные для доски %s: %s", board, exc)
+        return []
+    data = resp.json()
+    sec_block = data.get("securities", {})
+    cols: List[str] = sec_block.get("columns", [])
+    rows = sec_block.get("data", [])
+    col_index = {name: i for i, name in enumerate(cols)}
+
+    def col(row, name):
+        idx = col_index.get(name)
+        if idx is None:
+            return None
+        return row[idx]
+
+    result: List[BondRow] = []
+    for r in rows:
+        try:
+            prevprice = col(r, "PREVPRICE")
+            if prevprice is not None:
+                try:
+                    prevprice = float(prevprice)
+                except Exception:
+                    prevprice = None
+            facevalue = col(r, "FACEVALUE")
+            if facevalue is not None:
+                try:
+                    facevalue = float(facevalue)
+                except Exception:
+                    facevalue = None
+            yld = col(r, "YIELD")
+            if yld is None:
+                yld = col(r, "YIELDCLOSE")
+            if yld is not None:
+                try:
+                    yld = float(yld)
+                except Exception:
+                    yld = None
+            result.append(
+                BondRow(
+                    secid=str(col(r, "SECID") or ""),
+                    boardid=board,
+                    shortname=col(r, "SHORTNAME"),
+                    secname=col(r, "SECNAME"),
+                    isin=col(r, "ISIN"),
+                    facevalue=facevalue,
+                    prevprice=prevprice,
+                    yield_pct=yld,
+                    matdate=col(r, "MATDATE"),
+                    couponvalue=col(r, "COUPONVALUE"),
+                    couponpercent=col(r, "COUPONPERCENT"),
+                    issuer=col(r, "ISSUER") or col(r, "LATNAME") or col(r, "SECNAME"),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("parse row error: %s", exc)
+    logging.info("Загружено %s облигаций с доски %s", len(result), board)
+    return result
+
+
+def upsert_bonds(rows: List[BondRow]) -> None:
+    if not rows:
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.executemany(
+            """INSERT OR REPLACE INTO moex_bonds_raw
+                (secid,boardid,shortname,secname,isin,facevalue,prevprice,yield_pct,matdate,couponvalue,couponpercent,issuer)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            [
+                (
+                    r.secid,
+                    r.boardid,
+                    r.shortname,
+                    r.secname,
+                    r.isin,
+                    r.facevalue,
+                    r.prevprice,
+                    r.yield_pct,
+                    r.matdate,
+                    r.couponvalue,
+                    r.couponpercent,
+                    r.issuer,
+                )
+                for r in rows
+            ],
+        )
+        conn.commit()
+    logging.info("Сохранено/обновлено %s строк в moex_bonds_raw", len(rows))
+
+
+def screen(min_yield: float, max_price_pct: float) -> List[Dict[str, Any]]:
+    query = """
+    SELECT b.secid, b.boardid, b.shortname, b.secname, b.prevprice, b.yield_pct,
+           b.facevalue, b.matdate, b.couponpercent, b.couponvalue, b.issuer,
+           COALESCE(r.rating_group, 'UNSPECIFIED') AS rating_group,
+           (100 - b.prevprice) AS discount_from_par
+    FROM moex_bonds_raw b
+    LEFT JOIN issuer_ratings r ON r.issuer = b.issuer
+    WHERE b.prevprice IS NOT NULL
+      AND b.yield_pct IS NOT NULL
+      AND b.prevprice <= ?
+      AND b.yield_pct >= ?
+      AND b.prevprice > 0
+    ORDER BY rating_group, b.prevprice ASC
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute(query, (max_price_pct, min_yield))
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def print_grouped(items: List[Dict[str, Any]]) -> None:
+    if not items:
+        print("Нет облигаций, удовлетворяющих критериям.")
+        return
+    # Группировка по rating_group
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for it in items:
+        groups.setdefault(it["rating_group"], []).append(it)
+    for grp, rows in sorted(groups.items(), key=lambda kv: kv[0]):
+        print(f"\nРейтинг группа: {grp} (кол-во: {len(rows)})")
+        print("SECID  Price%  Yield%  Disc%  Maturity  Coupon%  Issuer")
+        for r in rows:
+            print(
+                f"{r['secid']:<8} {r['prevprice'] or 0:6.2f} {r['yield_pct'] or 0:6.2f} "
+                f"{r['discount_from_par'] or 0:6.2f} {str(r['matdate'] or '')[:10]:<10} "
+                f"{(r['couponpercent'] or 0):7.2f} {str(r['issuer'] or '')[:40]}"
+            )
+
+
+def export_csv(items: List[Dict[str, Any]], fname: str = "bonds_screen.csv") -> None:
+    if not items:
+        return
+    import csv
+
+    cols = list(items[0].keys())
+    with open(fname, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        w.writerows(items)
+    logging.info("Экспортирован отбор облигаций -> %s (rows=%s)", fname, len(items))
+
+
+def main() -> None:
+    setup_logging()
+    ensure_tables()
+    boards = [b.strip() for b in os.getenv("BONDS_BOARDS", ",".join(DEFAULT_BOARDS)).split(",") if b.strip()]
+    all_rows: List[BondRow] = []
+    for b in boards:
+        all_rows.extend(fetch_board(b))
+    upsert_bonds(all_rows)
+    min_yield = float(os.getenv("BONDS_MIN_YIELD", "20"))
+    max_price_pct = float(os.getenv("BONDS_MAX_PRICE_PCT", "80"))
+    filtered = screen(min_yield=min_yield, max_price_pct=max_price_pct)
+    print_grouped(filtered)
+    if os.getenv("BONDS_EXPORT_CSV", "0").lower() in {"1","true","yes"}:
+        export_csv(filtered)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
