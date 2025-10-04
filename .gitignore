@@ -5,5 +5,11 @@ __pycache__/
 # Local databases and secrets
 *.db
 
+# MOEX cache json blobs
+.moex_cache/
+
+# Export fallback lock files
+*_*_lock.xlsx
+
 # Virtual environments
 .venv/

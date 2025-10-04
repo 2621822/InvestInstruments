@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import os
 import logging
+import sqlite3
+import time
 from pathlib import Path
 
 from GorbunovInvestInstruments import data_prices as hist
@@ -44,6 +46,123 @@ def _setup_logging() -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+
+def _prune_orphans(board: str) -> dict[str, int]:
+    """Удалить 'осиротевшие' записи цен (те SECID, которых больше нет в perspective_shares).
+
+    Возвращает метрики: сколько найдено и сколько строк удалено.
+    Выполняется только если включено переменной окружения FULL_REFRESH_PRUNE_ORPHANS.
+    """
+    stats = {"orphans_before": 0, "rows_deleted": 0}
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT UPPER(secid) FROM perspective_shares WHERE secid IS NOT NULL AND TRIM(secid)<>''")
+            perspective = {r[0] for r in cur.fetchall()}
+            cur.execute("SELECT DISTINCT SECID FROM moex_history_perspective_shares WHERE BOARDID=?", (board,))
+            in_history = { (r[0] or "").upper() for r in cur.fetchall() if r[0] }
+            orphans = [o for o in in_history if o not in perspective]
+            stats["orphans_before"] = len(orphans)
+            deleted_total = 0
+            for sec in orphans:
+                cur.execute("DELETE FROM moex_history_perspective_shares WHERE BOARDID=? AND SECID=?", (board, sec))
+                deleted_total += cur.rowcount or 0
+            conn.commit()
+            stats["rows_deleted"] = deleted_total
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Не удалось выполнить очистку осиротевших бумаг: %s", exc)
+    return stats
+
+
+def _human_readable_report(summary: dict) -> str:
+    """Сформировать человекочитаемый многострочный отчёт (вариант 1)."""
+    lines: list[str] = []
+    fc = summary.get("full_coverage", {}) or {}
+    du = summary.get("daily_update", {}) or {}
+    forecasts_part = summary.get("forecasts") or summary.get("forecasts_error")
+    pot_part = summary.get("potentials") or summary.get("potentials_error")
+    exp_part = summary.get("export") or summary.get("export_error")
+    orphans = summary.get("orphans") or {}
+
+    total_persp = fc.get("всего_перспективных") or 0
+    coverage_after = fc.get("покрытие_после") or 0
+    extra = None
+    try:
+        extra = int(coverage_after) - int(total_persp)
+    except Exception:
+        extra = None
+    percent_cov = None
+    try:
+        percent_cov = f"{(int(total_persp) / int(total_persp) * 100):.0f}%" if total_persp else "0%"
+    except Exception:
+        percent_cov = "—"
+
+    lines.append("Итоги выполнения:\n")
+    lines.append("Перспективные бумаги:")
+    lines.append(f"  В списке сейчас: {total_persp}")
+    lines.append(f"  Покрытие до: {total_persp - (fc.get('отсутствовало_до') or 0)} (отсутствовало: {fc.get('отсутствовало_до')})")
+    lines.append(f"  Новых добавлено: {fc.get('загружено_новых')}")
+    if extra and extra > 0:
+        lines.append(f"  Покрытие после: {coverage_after} (лишних: {extra})")
+    else:
+        lines.append(f"  Покрытие после: {coverage_after}")
+    lines.append(f"  Процент покрытия: {percent_cov}")
+    if orphans and orphans.get("orphans_before"):
+        lines.append(f"  Осиротевших до очистки: {orphans.get('orphans_before')} (удалено строк: {orphans.get('rows_deleted')})")
+
+    lines.append("")
+    lines.append("Ежедневное обновление цен:")
+    lines.append(f"  Новых строк: {du.get('добавлено_строк')}")
+    lines.append(f"  Удалено старых: {du.get('удалено_старых')}")
+    lines.append(f"  HTTP-запросов: {du.get('http')}")
+    lines.append(f"  Повторов: {du.get('повторы')}")
+
+    lines.append("")
+    lines.append("Прогнозы:")
+    if summary.get("forecasts_error"):
+        lines.append(f"  Ошибка: {summary['forecasts_error']}")
+    else:
+        lines.append("  Режим: только отсутствующие")
+        lines.append("  Статус: OK")
+
+    lines.append("")
+    lines.append("Потенциалы:")
+    if summary.get("potentials_error"):
+        lines.append(f"  Ошибка: {summary['potentials_error']}")
+    else:
+        lines.append("  Статус: пересчитано")
+
+    lines.append("")
+    lines.append("Экспорт:")
+    if isinstance(exp_part, dict) and exp_part.get("excel"):
+        if exp_part.get("status") == "fallback":
+            lines.append(f"  Основной файл был заблокирован, сохранено во временный: {exp_part.get('excel_fallback')}")
+        else:
+            lines.append(f"  Статус: OK (файл: {exp_part.get('excel')})")
+        if exp_part.get("json"):
+            lines.append(f"  JSON: {exp_part.get('json')}")
+    else:
+        # строковое сообщение об ошибке
+        if isinstance(exp_part, str):
+            lines.append(f"  Ошибка: {exp_part}")
+        else:
+            lines.append("  Экспорт отключён или не выполнялся")
+
+    # Сводка по этапам
+    stages = [
+        ("full_coverage", summary.get("full_coverage"), summary.get("full_coverage") is not None),
+        ("daily_update", summary.get("daily_update"), summary.get("daily_update") is not None),
+        ("forecasts", summary.get("forecasts"), summary.get("forecasts_error") is None),
+        ("potentials", summary.get("potentials"), summary.get("potentials_error") is None),
+        ("export", summary.get("export"), summary.get("export_error") is None),
+    ]
+    total = len(stages)
+    ok = sum(1 for _n, _obj, good in stages if good)
+    lines.append("")
+    lines.append(f"Сводка: успешных этапов {ok} из {total}")
+
+    return "\n".join(lines)
 
 
 def refresh_all() -> dict:
@@ -110,6 +229,13 @@ def refresh_all() -> dict:
     else:
         logging.info("[3/5] Токен TINKOFF_INVEST_TOKEN не задан — пропуск шага прогнозов.")
 
+    # Опциональная очистка осиротевших бумаг перед пересчётом потенциалов
+    board = cov.get("board", "TQBR") if isinstance(cov, dict) else "TQBR"
+    if os.getenv("FULL_REFRESH_PRUNE_ORPHANS", "0").lower() in {"1", "true", "yes"}:
+        logging.info("Очистка осиротевших бумаг (FULL_REFRESH_PRUNE_ORPHANS=1)...")
+        orphan_stats = _prune_orphans(board)
+        summary["orphans"] = orphan_stats
+
     logging.info("[4/5] Пересчёт потенциалов...")
     try:
         potentials.compute_all(store=True)
@@ -127,6 +253,19 @@ def refresh_all() -> dict:
         try:
             exp = export_potentials(excel_name, json_name)
             summary["export"] = exp
+        except PermissionError as exc:
+            logging.warning("PermissionError при сохранении '%s': %s", excel_name, exc)
+            # fallback имя
+            fallback_name = f"{Path(excel_name).stem}_{time.strftime('%Y%m%d_%H%M%S')}_lock.xlsx"
+            try:
+                exp_fb = export_potentials(fallback_name, json_name)
+                exp_fb["status"] = "fallback"
+                exp_fb["excel_fallback"] = fallback_name
+                exp_fb["original_excel"] = excel_name
+                summary["export"] = exp_fb
+                logging.info("Экспорт сохранён во временный файл: %s", fallback_name)
+            except Exception as exc2:  # noqa: BLE001
+                summary["export_error"] = f"PermissionError: {exc}; fallback_fail: {exc2}"
         except Exception as exc:  # noqa: BLE001
             logging.warning("Ошибка экспорта потенциалов: %s", exc)
             summary["export_error"] = str(exc)
@@ -140,7 +279,4 @@ def refresh_all() -> dict:
 if __name__ == "__main__":  # pragma: no cover
     _setup_logging()
     result = refresh_all()
-    # Краткое резюме в консоль
-    print("Итог:")
-    for k, v in result.items():
-        print(f" - {k}: {v}")
+    print(_human_readable_report(result))
