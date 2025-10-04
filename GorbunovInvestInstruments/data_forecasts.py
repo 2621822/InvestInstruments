@@ -72,16 +72,15 @@ def _post(endpoint: str, payload: dict, token: str) -> dict | None:
                 raise requests.RequestException(f"Server {resp.status_code}")
             resp.raise_for_status()
             return resp.json()
-        except req_exc.SSLError as exc:  # noqa: BLE001
-            # Отдельная обработка SSL ошибок с подсказками
+        except req_exc.SSLError:  # noqa: BLE001
+            # Подавляем длинный стек и деталь сертификата — фиксируем только факт.
             if attempt == API_MAX_ATTEMPTS:
-                logging.error("API %s окончательно неуспешен (SSL): %s", endpoint, exc)
-                logging.error("Подсказки: проверьте корпоративный прокси / добавьте сертификат в TINKOFF_CA_BUNDLE или установите certifi --upgrade.")
+                logging.error("API %s неуспешен (SSL) после %s попыток", endpoint, attempt)
                 return None
             backoff = API_BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, API_BACKOFF_BASE)
             logging.warning(
-                "API %s SSL ошибка попытка %s/%s: %s (sleep %.2fs) — возможно самоподписанный корневой сертификат.",
-                endpoint, attempt, API_MAX_ATTEMPTS, exc, backoff,
+                "API %s SSL сбой попытка %s/%s (sleep %.2fs) — сертификат не подтверждён",
+                endpoint, attempt, API_MAX_ATTEMPTS, backoff,
             )
             time.sleep(backoff)
         except requests.RequestException as exc:  # noqa: BLE001
@@ -265,18 +264,26 @@ def EnsureForecastsForMissingShares(db_path: Path, token: str, *, prune: bool = 
                   AND NOT EXISTS (SELECT 1 FROM consensus_targets ct WHERE ct.uid=ps.uid)"""
         )
         rows = cur.fetchall()
-    processed = 0
+    stats = {"total_missing": len(rows), "added": 0, "empty": 0, "errors": 0}
     for uid, _ticker in rows:
-        c, t = GetConsensusByUid(uid, token)
-        AddConsensusForecasts(db_path, c)
-        AddConsensusTargets(db_path, t)
-        if c or t:
-            processed += 1
-    if processed:
-        logging.info("EnsureForecastsForMissingShares: добавлено %s", processed)
-    if prune and processed:
+        try:
+            c, t = GetConsensusByUid(uid, token)
+            if not c and not t:
+                stats["empty"] += 1
+                continue
+            AddConsensusForecasts(db_path, c)
+            AddConsensusTargets(db_path, t)
+            stats["added"] += 1
+        except Exception:  # noqa: BLE001
+            stats["errors"] += 1
+    if stats["total_missing"]:
+        logging.info(
+            "Forecasts missing=%s added=%s empty=%s errors=%s",
+            stats["total_missing"], stats["added"], stats["empty"], stats["errors"],
+        )
+    if prune and stats["added"]:
         PruneHistory(db_path, MAX_CONSENSUS_PER_UID, MAX_TARGETS_PER_ANALYST, max_age_days=MAX_HISTORY_DAYS)
-    logging.debug("EnsureForecastsForMissingShares завершено за %.2fs", time.perf_counter() - start)
+    logging.debug("EnsureForecastsForMissingShares %.2fs", time.perf_counter() - start)
 
 
 def UpdateConsensusForecasts(  # noqa: N802
@@ -295,10 +302,22 @@ def UpdateConsensusForecasts(  # noqa: N802
         else:
             cur.execute("SELECT uid FROM perspective_shares")
         uids = [r[0] for r in cur.fetchall()]
+    stats = {"total": len(uids), "updated": 0, "empty": 0, "errors": 0}
     for u in uids:
-        c, t = GetConsensusByUid(u, token)
-        AddConsensusForecasts(db_path, c)
-        AddConsensusTargets(db_path, t)
+        try:
+            c, t = GetConsensusByUid(u, token)
+            if not c and not t:
+                stats["empty"] += 1
+                continue
+            AddConsensusForecasts(db_path, c)
+            AddConsensusTargets(db_path, t)
+            stats["updated"] += 1
+        except Exception:  # noqa: BLE001
+            stats["errors"] += 1
+    logging.info(
+        "Forecasts all total=%s updated=%s empty=%s errors=%s",
+        stats["total"], stats["updated"], stats["empty"], stats["errors"],
+    )
     PruneHistory(
         db_path,
         max_consensus if max_consensus is not None else MAX_CONSENSUS_PER_UID,
