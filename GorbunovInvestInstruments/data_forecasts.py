@@ -113,12 +113,12 @@ def GetConsensusByUid(uid: str, token: str) -> tuple[dict | None, list[dict]]:  
     return data.get("consensus"), data.get("targets", [])
 
 
-def AddConsensusForecasts(db_path: Path, consensus: dict | None) -> None:  # noqa: N802
+def AddConsensusForecasts(db_path: Path, consensus: dict | None) -> int:  # noqa: N802
     if not consensus:
-        return
+        return 0
     uid = consensus.get("uid")
     if not uid:
-        return
+        return 0
     ticker = consensus.get("ticker", "")
     recommendation = consensus.get("recommendation")
     currency = consensus.get("currency")
@@ -204,12 +204,12 @@ def AddConsensusForecasts(db_path: Path, consensus: dict | None) -> None:  # noq
             row_hash = cur.fetchone()
             if row_hash and row_hash[0] and row_hash[0] == fp:
                 logging.debug("Consensus unchanged (hash match) skip uid=%s", uid)
-                return
+                return 0
         except Exception:
             pass
         if _same_record(last):
             logging.debug("Consensus unchanged (field compare) skip uid=%s", uid)
-            return
+            return 0
         rec_date = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         cur.execute(
             """INSERT INTO consensus_forecasts
@@ -218,12 +218,13 @@ def AddConsensusForecasts(db_path: Path, consensus: dict | None) -> None:  # noq
             (uid, ticker, recommendation, rec_date, currency, price_consensus, min_target, max_target, fp),
         )
         conn.commit()
+    return 1
 
 
-def AddConsensusTargets(db_path: Path, targets: list[dict]) -> None:  # noqa: N802
+def AddConsensusTargets(db_path: Path, targets: list[dict]) -> int:  # noqa: N802
     if not targets:
-        return
-    ins = 0
+        return 0
+    ins = 0  # общее количество вставленных таргетов
     with sqlite3.connect(db_path) as conn:
         cur = conn.cursor()
         for t in targets:
@@ -250,6 +251,7 @@ def AddConsensusTargets(db_path: Path, targets: list[dict]) -> None:  # noqa: N8
         conn.commit()
     if ins:
         logging.info("Добавлено целей аналитиков: %s", ins)
+    return ins
 
 
 def EnsureForecastsForMissingShares(db_path: Path, token: str, *, prune: bool = True) -> None:  # noqa: N802
@@ -264,23 +266,43 @@ def EnsureForecastsForMissingShares(db_path: Path, token: str, *, prune: bool = 
                   AND NOT EXISTS (SELECT 1 FROM consensus_targets ct WHERE ct.uid=ps.uid)"""
         )
         rows = cur.fetchall()
-    stats = {"total_missing": len(rows), "added": 0, "empty": 0, "errors": 0}
+    stats = {
+        "total_missing": len(rows),
+        "added": 0,  # uid с любым новым объектом (forecast или target)
+        "empty": 0,
+        "errors": 0,
+        "forecast_new": 0,
+        "target_new": 0,
+        "forecast_uids": set(),
+        "target_uids": set(),
+    }
     for uid, _ticker in rows:
         try:
             c, t = GetConsensusByUid(uid, token)
             if not c and not t:
                 stats["empty"] += 1
                 continue
-            AddConsensusForecasts(db_path, c)
-            AddConsensusTargets(db_path, t)
-            stats["added"] += 1
+            f_new = AddConsensusForecasts(db_path, c)
+            t_new_count = AddConsensusTargets(db_path, t)
+            if f_new:
+                stats["forecast_new"] += f_new
+                stats["forecast_uids"].add(uid)
+            if t_new_count:
+                stats["target_new"] += t_new_count
+                stats["target_uids"].add(uid)
+            if f_new or t_new_count:
+                stats["added"] += 1
         except Exception:  # noqa: BLE001
             stats["errors"] += 1
     if stats["total_missing"]:
         logging.info(
-            "Forecasts missing=%s added=%s empty=%s errors=%s",
-            stats["total_missing"], stats["added"], stats["empty"], stats["errors"],
+            "Forecasts missing=%s uids_added=%s forecasts_new=%s targets_new=%s empty=%s errors=%s",
+            stats["total_missing"], stats["added"], stats["forecast_new"], stats["target_new"], stats["empty"], stats["errors"],
         )
+        if stats["forecast_uids"]:
+            logging.info("Forecasts new uids: %s", ",".join(sorted(stats["forecast_uids"])))
+        if stats["target_uids"]:
+            logging.info("Targets new uids: %s", ",".join(sorted(stats["target_uids"])))
     if prune and stats["added"]:
         PruneHistory(db_path, MAX_CONSENSUS_PER_UID, MAX_TARGETS_PER_ANALYST, max_age_days=MAX_HISTORY_DAYS)
     logging.debug("EnsureForecastsForMissingShares %.2fs", time.perf_counter() - start)
@@ -302,22 +324,42 @@ def UpdateConsensusForecasts(  # noqa: N802
         else:
             cur.execute("SELECT uid FROM perspective_shares")
         uids = [r[0] for r in cur.fetchall()]
-    stats = {"total": len(uids), "updated": 0, "empty": 0, "errors": 0}
+    stats = {
+        "total": len(uids),
+        "updated": 0,  # uid с любыми новыми данными
+        "empty": 0,
+        "errors": 0,
+        "forecast_new": 0,
+        "target_new": 0,
+        "forecast_uids": set(),
+        "target_uids": set(),
+    }
     for u in uids:
         try:
             c, t = GetConsensusByUid(u, token)
             if not c and not t:
                 stats["empty"] += 1
                 continue
-            AddConsensusForecasts(db_path, c)
-            AddConsensusTargets(db_path, t)
-            stats["updated"] += 1
+            f_new = AddConsensusForecasts(db_path, c)
+            t_new_count = AddConsensusTargets(db_path, t)
+            if f_new:
+                stats["forecast_new"] += f_new
+                stats["forecast_uids"].add(u)
+            if t_new_count:
+                stats["target_new"] += t_new_count
+                stats["target_uids"].add(u)
+            if f_new or t_new_count:
+                stats["updated"] += 1
         except Exception:  # noqa: BLE001
             stats["errors"] += 1
     logging.info(
-        "Forecasts all total=%s updated=%s empty=%s errors=%s",
-        stats["total"], stats["updated"], stats["empty"], stats["errors"],
+        "Forecasts all total=%s uids_updated=%s forecasts_new=%s targets_new=%s empty=%s errors=%s",
+        stats["total"], stats["updated"], stats["forecast_new"], stats["target_new"], stats["empty"], stats["errors"],
     )
+    if stats["forecast_uids"]:
+        logging.info("Forecasts new uids: %s", ",".join(sorted(stats["forecast_uids"])))
+    if stats["target_uids"]:
+        logging.info("Targets new uids: %s", ",".join(sorted(stats["target_uids"])))
     PruneHistory(
         db_path,
         max_consensus if max_consensus is not None else MAX_CONSENSUS_PER_UID,
