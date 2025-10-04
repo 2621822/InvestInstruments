@@ -54,7 +54,7 @@ def _prune_orphans(board: str) -> dict[str, int]:
     Возвращает метрики: сколько найдено и сколько строк удалено.
     Выполняется только если включено переменной окружения FULL_REFRESH_PRUNE_ORPHANS.
     """
-    stats = {"orphans_before": 0, "rows_deleted": 0}
+    stats = {"orphans_before": 0, "rows_deleted": 0, "orphans_list": []}
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
@@ -64,12 +64,15 @@ def _prune_orphans(board: str) -> dict[str, int]:
             in_history = { (r[0] or "").upper() for r in cur.fetchall() if r[0] }
             orphans = [o for o in in_history if o not in perspective]
             stats["orphans_before"] = len(orphans)
+            stats["orphans_list"] = sorted(orphans)
             deleted_total = 0
             for sec in orphans:
                 cur.execute("DELETE FROM moex_history_perspective_shares WHERE BOARDID=? AND SECID=?", (board, sec))
                 deleted_total += cur.rowcount or 0
             conn.commit()
             stats["rows_deleted"] = deleted_total
+            for sec in orphans:
+                logging.info("Удалён лишний SECID (нет в perspective_shares): %s", sec)
     except Exception as exc:  # noqa: BLE001
         logging.warning("Не удалось выполнить очистку осиротевших бумаг: %s", exc)
     return stats
@@ -110,6 +113,9 @@ def _human_readable_report(summary: dict) -> str:
     lines.append(f"  Процент покрытия: {percent_cov}")
     if orphans and orphans.get("orphans_before"):
         lines.append(f"  Осиротевших до очистки: {orphans.get('orphans_before')} (удалено строк: {orphans.get('rows_deleted')})")
+        if orphans.get("orphans_list"):
+            shown = ",".join(orphans.get("orphans_list")[:10])
+            lines.append(f"  Удалены SECID: {shown}{' ...' if len(orphans.get('orphans_list'))>10 else ''}")
 
     lines.append("")
     lines.append("Ежедневное обновление цен:")
@@ -213,6 +219,23 @@ def refresh_all() -> dict:
         "загружено_новых": cov.get("processed_missing"),
         "покрытие_после": cov.get("coverage_after"),
     }
+    # Автоматическое удаление осиротевших (если обнаружены лишние SECID) сразу после покрытия
+    try:
+        total_persp = summary["full_coverage"]["всего_перспективных"] or 0
+        coverage_after = summary["full_coverage"]["покрытие_после"] or 0
+        board = cov.get("board", "TQBR") if isinstance(cov, dict) else "TQBR"
+        if coverage_after and total_persp and coverage_after > total_persp:
+            logging.info("Обнаружены лишние SECID в истории (coverage_after=%s > перспективных=%s) — выполняю очистку сразу.", coverage_after, total_persp)
+            orphan_stats = _prune_orphans(board)
+            summary["orphans"] = orphan_stats
+            # Пересчитать coverage_after (новое значение после удаления)
+            with sqlite3.connect(DB_PATH) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(DISTINCT SECID) FROM moex_history_perspective_shares WHERE BOARDID=?", (board,))
+                new_cov = cur.fetchone()[0] or 0
+            summary["full_coverage"]["покрытие_после"] = new_cov
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Не удалось автоматически пересчитать покрытие после очистки: %s", exc)
 
     logging.info("[2/5] Ежедневная инкрементальная догрузка котировок (daily_update_all)...")
     daily = hist.daily_update_all(recompute_potentials=False)
@@ -266,12 +289,11 @@ def refresh_all() -> dict:
     else:
         logging.info("[3/5] Токен TINKOFF_INVEST_TOKEN не задан — пропуск шага прогнозов.")
 
-    # Опциональная очистка осиротевших бумаг перед пересчётом потенциалов
+    # (Сохранено: ручная очистка по переменной окружения — вдруг пользователь хочет принудительно)
     board = cov.get("board", "TQBR") if isinstance(cov, dict) else "TQBR"
-    if os.getenv("FULL_REFRESH_PRUNE_ORPHANS", "0").lower() in {"1", "true", "yes"}:
+    if os.getenv("FULL_REFRESH_PRUNE_ORPHANS", "0").lower() in {"1", "true", "yes"} and "orphans" not in summary:
         logging.info("Очистка осиротевших бумаг (FULL_REFRESH_PRUNE_ORPHANS=1)...")
-        orphan_stats = _prune_orphans(board)
-        summary["orphans"] = orphan_stats
+        summary["orphans"] = _prune_orphans(board)
 
     logging.info("[4/5] Пересчёт потенциалов...")
     try:
