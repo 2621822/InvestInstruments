@@ -28,6 +28,21 @@ DB_PATH = Path("GorbunovInvestInstruments.db")
 TABLE_NAME = "moex_history_perspective_shares"
 DEFAULT_HORIZON_DAYS = 1100
 
+# Упрощённый список (фиксированные даты) официальных праздников РФ
+# Без учёта переносов выходных и дополнительных постановлений.
+_FIXED_HOLIDAYS = {
+    (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (1, 7), (1, 8),  # Новогодние каникулы + Рождество
+    (2, 23),  # День защитника Отечества
+    (3, 8),   # Международный женский день
+    (5, 1), (5, 9),  # Праздники мая
+    (6, 12),  # День России
+    (11, 4),  # День народного единства
+}
+
+
+def _is_russian_holiday(d: dt.date) -> bool:
+    return (d.month, d.day) in _FIXED_HOLIDAYS
+
 CREATE_TABLE_SQL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
     BOARDID TEXT,
@@ -212,6 +227,22 @@ def GetMoexHistory(board: str = "TQBR", secid: str = "PLZL", dr_start: Optional[
             else:
                 start_date = today - dt.timedelta(days=DEFAULT_HORIZON_DAYS)
         if start_date > end_date:
+            # Уже всё скачано ранее – классифицируем как 'already' / weekend / holiday
+            reason_date = end_date
+            if reason_date.weekday() >= 5:
+                reason = " weekend"
+            elif _is_russian_holiday(reason_date):
+                reason = " holiday"
+            else:
+                reason = " already"
+            base_from = reason_date.isoformat(); base_till = reason_date.isoformat()
+            def _fmt_dm(s: str) -> str:
+                try:
+                    dloc = _date(s); return dloc.strftime("%d.%m")
+                except Exception:  # noqa: BLE001
+                    return s
+            from_fmt = _fmt_dm(base_from); till_fmt = _fmt_dm(base_till)
+            logging.info("GetMoexHistory %s %s +0%s %s→%s (0.00s)", board, secid, reason, from_fmt, till_fmt)
             return 0
         base_from = start_date.isoformat(); base_till = end_date.isoformat(); start_offset = 0; inserted = 0; total_reported = None
         t0 = time.perf_counter()
@@ -249,39 +280,30 @@ def GetMoexHistory(board: str = "TQBR", secid: str = "PLZL", dr_start: Optional[
                 potentials.compute_all(store=True)
             except Exception as exc:  # noqa: BLE001
                 logging.debug("Potentials recompute fail %s: %s", secid, exc)
-        # Формат лога (RU компакт): HH:MM:SS GetMoexHistory TQBR SECID +N [reason_if_zero] DD.MM→DD.MM X.XXs
+        # Новый формат: GetMoexHistory TQBR SECID +N <reason_if_zero> DD.MM→DD.MM (X.XXs)
         try:
-            import datetime as _dt_internal  # локальный импорт для формата времени
-            now_time = _dt_internal.datetime.now().strftime("%H:%M:%S")
-            # Интервал в формате ДД.MM
             def _fmt_dm(s: str) -> str:
                 try:
-                    d = _dt_internal.datetime.strptime(s, "%Y-%m-%d")
-                    return d.strftime("%d.%m")
+                    dloc = _date(s); return dloc.strftime("%d.%m")
                 except Exception:  # noqa: BLE001
                     return s
-            from_fmt = _fmt_dm(base_from)
-            till_fmt = _fmt_dm(base_till)
+            from_fmt = _fmt_dm(base_from); till_fmt = _fmt_dm(base_till)
             duration = time.perf_counter() - t0
-            # Определение причины при inserted == 0
             reason = ""
             if inserted == 0:
-                try:
-                    end_d = _dt_internal.datetime.strptime(base_till, "%Y-%m-%d").date()
-                    if end_d.weekday() >= 5:  # 5=Saturday,6=Sunday
-                        reason = " weekend"
-                    else:
-                        # различим пустой ответ vs актуально
-                        if total_reported in (0, None) and start_offset == 0:
-                            reason = " empty"
-                        else:
-                            reason = " up-to-date"
-                except Exception:  # noqa: BLE001
+                end_d = end_date
+                if end_d.weekday() >= 5:
+                    reason = " weekend"
+                elif _is_russian_holiday(end_d):
+                    reason = " holiday"
+                elif base_from == base_till:
+                    reason = " already"
+                elif total_reported in (0, None) and start_offset == 0:
+                    reason = " empty"
+                else:
                     reason = " up-to-date"
-            log_line = f"{now_time} GetMoexHistory {board} {secid} +{inserted}{reason} {from_fmt}→{till_fmt} {duration:.2f}s"
-            logging.info(log_line)
+            logging.info("GetMoexHistory %s %s +%d%s %s→%s (%.2fs)", board, secid, inserted, reason, from_fmt, till_fmt, duration)
         except Exception:
-            # fallback на прежний вариант при любой ошибке форматирования
             logging.info("GetMoexHistory %s %s inserted=%s interval %s..%s", board, secid, inserted, base_from, base_till)
         return inserted
     finally:
