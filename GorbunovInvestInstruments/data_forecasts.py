@@ -18,7 +18,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Dict
 
 import requests
 from requests import exceptions as req_exc
@@ -254,10 +254,18 @@ def AddConsensusTargets(db_path: Path, targets: list[dict]) -> int:  # noqa: N80
     return ins
 
 
-def EnsureForecastsForMissingShares(db_path: Path, token: str, *, prune: bool = True) -> None:  # noqa: N802
+def EnsureForecastsForMissingShares(db_path: Path, token: str, *, prune: bool = True) -> Dict[str, Any]:  # noqa: N802
     start = time.perf_counter()
     if not token:
-        return
+        return {
+            "total_missing": 0,
+            "added": 0,
+            "empty": 0,
+            "errors": 0,
+            "forecast_new": 0,
+            "target_new": 0,
+            "details": [],
+        }
     with sqlite3.connect(db_path) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -266,7 +274,7 @@ def EnsureForecastsForMissingShares(db_path: Path, token: str, *, prune: bool = 
                   AND NOT EXISTS (SELECT 1 FROM consensus_targets ct WHERE ct.uid=ps.uid)"""
         )
         rows = cur.fetchall()
-    stats = {
+    stats: Dict[str, Any] = {
         "total_missing": len(rows),
         "added": 0,  # uid с любым новым объектом (forecast или target)
         "empty": 0,
@@ -275,6 +283,7 @@ def EnsureForecastsForMissingShares(db_path: Path, token: str, *, prune: bool = 
         "target_new": 0,
         "forecast_uids": set(),
         "target_uids": set(),
+        "details": [],  # список словарей per uid
     }
     for uid, _ticker in rows:
         try:
@@ -292,6 +301,25 @@ def EnsureForecastsForMissingShares(db_path: Path, token: str, *, prune: bool = 
                 stats["target_uids"].add(uid)
             if f_new or t_new_count:
                 stats["added"] += 1
+            # Детализация по uid
+            rec = None; consensus_price = None
+            if c:
+                rec = c.get("recommendation")
+                try:
+                    val = c.get("consensus") if isinstance(c, dict) else None
+                    if isinstance(val, dict):
+                        units = int(val.get("units", 0)); nano = int(val.get("nano", 0))
+                        consensus_price = units + nano / 1_000_000_000
+                except Exception:  # noqa: BLE001
+                    consensus_price = None
+            stats["details"].append({
+                "uid": uid,
+                "ticker": _ticker,
+                "forecast_added": bool(f_new),
+                "recommendation": rec,
+                "consensus_price": consensus_price,
+                "targets_added": t_new_count,
+            })
         except Exception:  # noqa: BLE001
             stats["errors"] += 1
     if stats["total_missing"]:
@@ -306,6 +334,10 @@ def EnsureForecastsForMissingShares(db_path: Path, token: str, *, prune: bool = 
     if prune and stats["added"]:
         PruneHistory(db_path, MAX_CONSENSUS_PER_UID, MAX_TARGETS_PER_ANALYST, max_age_days=MAX_HISTORY_DAYS)
     logging.debug("EnsureForecastsForMissingShares %.2fs", time.perf_counter() - start)
+    # Преобразуем множества в списки для сериализации
+    stats["forecast_uids"] = sorted(stats["forecast_uids"])
+    stats["target_uids"] = sorted(stats["target_uids"])
+    return stats
 
 
 def UpdateConsensusForecasts(  # noqa: N802

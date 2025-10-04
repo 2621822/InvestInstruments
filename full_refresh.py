@@ -80,8 +80,8 @@ def _human_readable_report(summary: dict) -> str:
     lines: list[str] = []
     fc = summary.get("full_coverage", {}) or {}
     du = summary.get("daily_update", {}) or {}
-    forecasts_part = summary.get("forecasts") or summary.get("forecasts_error")
-    pot_part = summary.get("potentials") or summary.get("potentials_error")
+    forecasts_part = summary.get("forecasts") or summary.get("forecasts_error")  # noqa: F841 (оставлено для возможного будущего использования)
+    pot_part = summary.get("potentials") or summary.get("potentials_error")  # noqa: F841
     exp_part = summary.get("export") or summary.get("export_error")
     orphans = summary.get("orphans") or {}
 
@@ -125,13 +125,49 @@ def _human_readable_report(summary: dict) -> str:
     else:
         lines.append("  Режим: только отсутствующие")
         lines.append("  Статус: OK")
+        fobj = summary.get("forecasts", {}) or {}
+        if isinstance(fobj, dict):
+            lines.append(
+                "  UID с новыми данными: "
+                f"{fobj.get('added', 0)} (forecasts_new={fobj.get('forecast_new', 0)}, targets_new={fobj.get('target_new', 0)})"
+            )
+            details = fobj.get("details") or []
+            if details:
+                lines.append("  Детализация новых (ticker rec consensus targets+):")
+                # ограничим вывод первыми 25 строками
+                shown = 0
+                for d in details:
+                    if not d.get("forecast_added") and not d.get("targets_added"):
+                        continue
+                    if shown >= 25:
+                        lines.append("    ... (ещё скрыто)")
+                        break
+                    rec = d.get("recommendation") or "?"
+                    cp = d.get("consensus_price")
+                    cp_str = f"{cp:.2f}" if isinstance(cp, (int, float)) else "—"
+                    lines.append(
+                        f"    {d.get('ticker')} {rec} {cp_str} {d.get('targets_added')}"
+                    )
+                    shown += 1
 
     lines.append("")
     lines.append("Потенциалы:")
     if summary.get("potentials_error"):
         lines.append(f"  Ошибка: {summary['potentials_error']}")
     else:
+        pobj = summary.get("potentials", {}) or {}
         lines.append("  Статус: пересчитано")
+        if isinstance(pobj, dict):
+            if pobj.get("count") is not None:
+                lines.append(f"  Всего записей: {pobj.get('count')}")
+            chf = pobj.get("changed_by_forecast") or []
+            if chf:
+                lines.append(f"  Затронуты новыми прогнозами/таргетами: {len(chf)} uid")
+        top_list = summary.get("potentials_top") or []
+        if top_list:
+            lines.append("  ТОП по потенциалу (ticker %):")
+            for p in top_list[:15]:
+                lines.append(f"    {p['ticker']} {p['potential_pct']}")
 
     lines.append("")
     lines.append("Экспорт:")
@@ -217,12 +253,13 @@ def refresh_all() -> dict:
                     logging.warning("Файл tinkoff_token.txt найден, но валидных (непустых) строк не обнаружено — шаг прогнозов будет пропущен.")
             except Exception as exc:  # noqa: BLE001
                 logging.warning("Не удалось прочитать tinkoff_token.txt: %s", exc)
+    forecast_stats = None
     if token:
         logging.info("[3/5] Обнаружен токен для прогнозов (source=%s, masked=%s)", token_source, _mask_token(token))
         logging.info("[3/5] Загрузка / актуализация консенсус‑прогнозов и целей аналитиков...")
         try:
-            forecasts.EnsureForecastsForMissingShares(DB_PATH, token, prune=True)
-            summary["forecasts"] = {"статус": "обновление выполнено (только отсутствующие)"}
+            forecast_stats = forecasts.EnsureForecastsForMissingShares(DB_PATH, token, prune=True)
+            summary["forecasts"] = {"статус": "обновление выполнено (только отсутствующие)", **forecast_stats}
         except Exception as exc:  # noqa: BLE001
             logging.warning("Ошибка загрузки прогнозов: %s", exc)
             summary["forecasts_error"] = str(exc)
@@ -238,8 +275,17 @@ def refresh_all() -> dict:
 
     logging.info("[4/5] Пересчёт потенциалов...")
     try:
-        potentials.compute_all(store=True)
-        summary["potentials"] = {"статус": "пересчитано"}
+        pot_entries = potentials.compute_all(store=True)
+        changed_uids = set()
+        if forecast_stats:
+            changed_uids.update(forecast_stats.get("forecast_uids", []))
+            changed_uids.update(forecast_stats.get("target_uids", []))
+        top_sorted = [p for p in pot_entries if p.get("pricePotentialRel") is not None]
+        top_sorted.sort(key=lambda x: x.get("pricePotentialRel") or 0, reverse=True)
+        summary["potentials"] = {"статус": "пересчитано", "count": len(pot_entries), "changed_by_forecast": sorted(changed_uids)}
+        summary["potentials_top"] = [
+            {"ticker": p["ticker"], "potential_pct": f"{(p['pricePotentialRel']*100):.0f}%"} for p in top_sorted
+        ]
     except Exception as exc:  # noqa: BLE001
         logging.error("Ошибка пересчёта потенциалов: %s", exc)
         summary["potentials_error"] = str(exc)
