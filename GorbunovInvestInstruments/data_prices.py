@@ -249,7 +249,40 @@ def GetMoexHistory(board: str = "TQBR", secid: str = "PLZL", dr_start: Optional[
                 potentials.compute_all(store=True)
             except Exception as exc:  # noqa: BLE001
                 logging.debug("Potentials recompute fail %s: %s", secid, exc)
-        logging.info("GetMoexHistory %s %s inserted=%s interval %s..%s", board, secid, inserted, base_from, base_till)
+        # Формат лога (RU компакт): HH:MM:SS GetMoexHistory TQBR SECID +N [reason_if_zero] DD.MM→DD.MM X.XXs
+        try:
+            import datetime as _dt_internal  # локальный импорт для формата времени
+            now_time = _dt_internal.datetime.now().strftime("%H:%M:%S")
+            # Интервал в формате ДД.MM
+            def _fmt_dm(s: str) -> str:
+                try:
+                    d = _dt_internal.datetime.strptime(s, "%Y-%m-%d")
+                    return d.strftime("%d.%m")
+                except Exception:  # noqa: BLE001
+                    return s
+            from_fmt = _fmt_dm(base_from)
+            till_fmt = _fmt_dm(base_till)
+            duration = time.perf_counter() - t0
+            # Определение причины при inserted == 0
+            reason = ""
+            if inserted == 0:
+                try:
+                    end_d = _dt_internal.datetime.strptime(base_till, "%Y-%m-%d").date()
+                    if end_d.weekday() >= 5:  # 5=Saturday,6=Sunday
+                        reason = " weekend"
+                    else:
+                        # различим пустой ответ vs актуально
+                        if total_reported in (0, None) and start_offset == 0:
+                            reason = " empty"
+                        else:
+                            reason = " up-to-date"
+                except Exception:  # noqa: BLE001
+                    reason = " up-to-date"
+            log_line = f"{now_time} GetMoexHistory {board} {secid} +{inserted}{reason} {from_fmt}→{till_fmt} {duration:.2f}s"
+            logging.info(log_line)
+        except Exception:
+            # fallback на прежний вариант при любой ошибке форматирования
+            logging.info("GetMoexHistory %s %s inserted=%s interval %s..%s", board, secid, inserted, base_from, base_till)
         return inserted
     finally:
         conn.close()
