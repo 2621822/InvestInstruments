@@ -162,13 +162,16 @@ def _human_readable_report(summary: dict) -> str:
         lines.append(f"  Ошибка: {summary['potentials_error']}")
     else:
         pobj = summary.get("potentials", {}) or {}
-        lines.append("  Статус: пересчитано")
         if isinstance(pobj, dict):
-            if pobj.get("count") is not None:
-                lines.append(f"  Всего записей: {pobj.get('count')}")
-            chf = pobj.get("changed_by_forecast") or []
-            if chf:
-                lines.append(f"  Затронуты новыми прогнозами/таргетами: {len(chf)} uid")
+            lines.append(f"  Статус: {pobj.get('статус','')}")
+            lines.append(f"  Всего инструментов: {pobj.get('count')}")
+            if pobj.get("changed_total") is not None:
+                kd = pobj.get("kinds", {})
+                lines.append(
+                    "  Изменения: "
+                    f"{pobj.get('changed_total')} (new={kd.get('new',0)}, price={kd.get('price',0)}, forecast={kd.get('forecast',0)}, both={kd.get('both',0)})"
+                )
+                lines.append(f"  Без изменений: {kd.get('none',0)}")
         top_list = summary.get("potentials_top") or []
         if top_list:
             lines.append("  ТОП по потенциалу (ticker %):")
@@ -219,23 +222,6 @@ def refresh_all() -> dict:
         "загружено_новых": cov.get("processed_missing"),
         "покрытие_после": cov.get("coverage_after"),
     }
-    # Автоматическое удаление осиротевших (если обнаружены лишние SECID) сразу после покрытия
-    try:
-        total_persp = summary["full_coverage"]["всего_перспективных"] or 0
-        coverage_after = summary["full_coverage"]["покрытие_после"] or 0
-        board = cov.get("board", "TQBR") if isinstance(cov, dict) else "TQBR"
-        if coverage_after and total_persp and coverage_after > total_persp:
-            logging.info("Обнаружены лишние SECID в истории (coverage_after=%s > перспективных=%s) — выполняю очистку сразу.", coverage_after, total_persp)
-            orphan_stats = _prune_orphans(board)
-            summary["orphans"] = orphan_stats
-            # Пересчитать coverage_after (новое значение после удаления)
-            with sqlite3.connect(DB_PATH) as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT COUNT(DISTINCT SECID) FROM moex_history_perspective_shares WHERE BOARDID=?", (board,))
-                new_cov = cur.fetchone()[0] or 0
-            summary["full_coverage"]["покрытие_после"] = new_cov
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("Не удалось автоматически пересчитать покрытие после очистки: %s", exc)
 
     logging.info("[2/5] Ежедневная инкрементальная догрузка котировок (daily_update_all)...")
     daily = hist.daily_update_all(recompute_potentials=False)
@@ -295,16 +281,25 @@ def refresh_all() -> dict:
         logging.info("Очистка осиротевших бумаг (FULL_REFRESH_PRUNE_ORPHANS=1)...")
         summary["orphans"] = _prune_orphans(board)
 
-    logging.info("[4/5] Пересчёт потенциалов...")
+    logging.info("[4/5] Пересчёт потенциалов (с пропуском неизменившихся)...")
     try:
         pot_entries = potentials.compute_all(store=True)
-        changed_uids = set()
-        if forecast_stats:
-            changed_uids.update(forecast_stats.get("forecast_uids", []))
-            changed_uids.update(forecast_stats.get("target_uids", []))
+        # Агрегируем изменения
+        kinds = {"new":0,"price":0,"forecast":0,"both":0,"none":0}
+        for e in pot_entries:
+            k = e.get("changeKind") or "none"
+            if k not in kinds: kinds[k] = 0
+            kinds[k] += 1
+        changed_total = kinds.get("new",0)+kinds.get("price",0)+kinds.get("forecast",0)+kinds.get("both",0)
+        status = "без изменений" if changed_total == 0 else "изменения зафиксированы"
         top_sorted = [p for p in pot_entries if p.get("pricePotentialRel") is not None]
         top_sorted.sort(key=lambda x: x.get("pricePotentialRel") or 0, reverse=True)
-        summary["potentials"] = {"статус": "пересчитано", "count": len(pot_entries), "changed_by_forecast": sorted(changed_uids)}
+        summary["potentials"] = {
+            "статус": status,
+            "count": len(pot_entries),
+            "changed_total": changed_total,
+            "kinds": kinds,
+        }
         summary["potentials_top"] = [
             {"ticker": p["ticker"], "potential_pct": f"{(p['pricePotentialRel']*100):.0f}%"} for p in top_sorted
         ]

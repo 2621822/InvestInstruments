@@ -18,12 +18,13 @@
 """
 from __future__ import annotations
 
-from math import isfinite
+from math import isfinite, isclose
 from pathlib import Path
 from typing import Any, List, Dict
 from datetime import datetime, timezone
 import logging
 import sqlite3
+import os
 
 DB_PATH = Path("GorbunovInvestInstruments.db")
 
@@ -70,7 +71,14 @@ def _ensure_table() -> None:
 def compute_all(store: bool = True, stale_days: int = 10) -> List[Dict[str, Any]]:
     """Пересчитать потенциалы по ВСЕМ бумагам.
 
-    Возвращает список словарей; при store=True выполняет upsert текущего дня.
+    НЕ создаём новую запись за сегодня, если prevClose и consensusPrice не
+    изменились (с допуском) относительно последней сохранённой записи (любая дата).
+    Так база фиксирует только моменты изменения данных.
+
+    Возвращает список словарей с полями:
+      uid, ticker, prevClose, consensusPrice, pricePotentialRel, isStale,
+      changed(bool), changeKind(str)
+    changeKind: 'none' | 'price' | 'forecast' | 'both' | 'new'
     """
     results: List[Dict[str, Any]] = []
     if store:
@@ -110,6 +118,37 @@ def compute_all(store: bool = True, stale_days: int = 10) -> List[Dict[str, Any]
                     is_stale = 1
             except Exception:  # noqa: BLE001
                 pass
+        # Определяем было ли изменение относительно последней сохранённой записи (любая дата)
+        last_prev = last_cons = None
+        last_date = None
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT prevClose, consensusPrice, computedDate FROM instrument_potentials WHERE uid=? ORDER BY computedDate DESC LIMIT 1",
+                (uid,),
+            )
+            rlast = cur.fetchone()
+            if rlast:
+                last_prev, last_cons, last_date = rlast
+
+        tol = 1e-9
+        changed_price = not (last_prev is not None and prev_close is not None and isclose(float(last_prev), float(prev_close), abs_tol=tol))
+        if last_prev is None and prev_close is None:
+            changed_price = False
+        changed_forecast = not (last_cons is not None and consensus_price is not None and isclose(float(last_cons), float(consensus_price), abs_tol=tol))
+        if last_cons is None and consensus_price is None:
+            changed_forecast = False
+
+        changed_kind = "none"
+        if last_date is None:
+            changed_kind = "new"
+        elif changed_price and changed_forecast:
+            changed_kind = "both"
+        elif changed_price:
+            changed_kind = "price"
+        elif changed_forecast:
+            changed_kind = "forecast"
+
         entry = {
             "uid": uid,
             "ticker": ticker,
@@ -117,18 +156,22 @@ def compute_all(store: bool = True, stale_days: int = 10) -> List[Dict[str, Any]
             "consensusPrice": consensus_price,
             "pricePotentialRel": potential,
             "isStale": is_stale,
+            "changed": changed_kind != "none",
+            "changeKind": changed_kind,
         }
         results.append(entry)
         if store:
-            try:
-                with sqlite3.connect(DB_PATH) as conn:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO instrument_potentials (uid,ticker,computedDate,prevClose,consensusPrice,pricePotentialRel,isStale) VALUES (?,?,?,?,?,?,?)",
-                        (uid, ticker, today, prev_close, consensus_price, potential, is_stale),
-                    )
-                    conn.commit()
-            except Exception as exc:  # noqa: BLE001
-                logging.debug("compute_all: не удалось сохранить %s: %s", ticker, exc)
+            # Вставляем новую запись ТОЛЬКО если нет предыдущей или есть изменение в цене или прогнозе
+            if last_date is None or changed_kind != "none" or os.getenv("POTENTIALS_FORCE_DAILY", "0").lower() in {"1","true","yes"}:
+                try:
+                    with sqlite3.connect(DB_PATH) as conn:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO instrument_potentials (uid,ticker,computedDate,prevClose,consensusPrice,pricePotentialRel,isStale) VALUES (?,?,?,?,?,?,?)",
+                            (uid, ticker, today, prev_close, consensus_price, potential, is_stale),
+                        )
+                        conn.commit()
+                except Exception as exc:  # noqa: BLE001
+                    logging.debug("compute_all: не удалось сохранить %s: %s", ticker, exc)
     logging.info("compute_all: завершено для %s бумаг (%s)", len(results), today)
     return results
 
