@@ -17,7 +17,7 @@
 Параметры окружения:
   BONDS_BOARDS=TQOB,TQCB  (список досок, запятая)
   BONDS_MIN_YIELD=20
-    BONDS_MAX_PRICE_PCT=90   (максимальный PREVPRICE, чтобы считалось 10% ниже номинала)
+        BONDS_MAX_PRICE_PCT=90   (максимальная цена в % от номинала, чтобы считалось >=10% ниже номинала)
     BONDS_EXPORT_CSV=1       (экспорт результата в bonds_screen.csv)
     BONDS_EXPORT_XLSX=1      (экспорт результата в bonds_screen.xlsx)
 """
@@ -47,12 +47,13 @@ class BondRow:
     secname: str | None
     isin: str | None
     facevalue: float | None
-    prevprice: float | None
+    prevprice: float | None  # как возвращает ISS (часто % от номинала, но иногда абсолют)
     yield_pct: float | None
     matdate: str | None
     couponvalue: float | None
     couponpercent: float | None
     issuer: str | None
+    couponperiod: float | None  # дни между купонами (для расчёта годовой)
 
 
 def setup_logging() -> None:
@@ -64,22 +65,31 @@ def ensure_tables() -> None:
         c = conn.cursor()
         c.execute(
             """CREATE TABLE IF NOT EXISTS moex_bonds_raw (
-                    secid TEXT,
-                    boardid TEXT,
-                    shortname TEXT,
-                    secname TEXT,
-                    isin TEXT,
-                    facevalue REAL,
-                    prevprice REAL,
-                    yield_pct REAL,
-                    matdate TEXT,
-                    couponvalue REAL,
-                    couponpercent REAL,
-                    issuer TEXT,
-                    updatedAt TEXT DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (secid, boardid)
+                secid TEXT,
+                boardid TEXT,
+                shortname TEXT,
+                secname TEXT,
+                isin TEXT,
+                facevalue REAL,
+                prevprice REAL,
+                yield_pct REAL,
+                matdate TEXT,
+                couponvalue REAL,
+                couponpercent REAL,
+                couponperiod REAL,
+                issuer TEXT,
+                updatedAt TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (secid, boardid)
             )"""
         )
+        # миграция: добавить couponperiod если отсутствует
+        try:
+            c.execute("PRAGMA table_info(moex_bonds_raw)")
+            cols = {r[1] for r in c.fetchall()}
+            if 'couponperiod' not in cols:
+                c.execute("ALTER TABLE moex_bonds_raw ADD COLUMN couponperiod REAL")
+        except Exception:  # noqa: BLE001
+            pass
         c.execute(
             """CREATE TABLE IF NOT EXISTS issuer_ratings (
                     issuer TEXT PRIMARY KEY,
@@ -119,6 +129,12 @@ def fetch_board(board: str) -> List[BondRow]:
                     prevprice = float(prevprice)
                 except Exception:
                     prevprice = None
+            couponperiod = col(r, "COUPONPERIOD")
+            if couponperiod is not None:
+                try:
+                    couponperiod = float(couponperiod)
+                except Exception:
+                    couponperiod = None
             facevalue = col(r, "FACEVALUE")
             if facevalue is not None:
                 try:
@@ -147,6 +163,7 @@ def fetch_board(board: str) -> List[BondRow]:
                     couponvalue=col(r, "COUPONVALUE"),
                     couponpercent=col(r, "COUPONPERCENT"),
                     issuer=col(r, "ISSUER") or col(r, "LATNAME") or col(r, "SECNAME"),
+                    couponperiod=couponperiod,
                 )
             )
         except Exception as exc:  # noqa: BLE001
@@ -162,8 +179,8 @@ def upsert_bonds(rows: List[BondRow]) -> None:
         cur = conn.cursor()
         cur.executemany(
             """INSERT OR REPLACE INTO moex_bonds_raw
-                (secid,boardid,shortname,secname,isin,facevalue,prevprice,yield_pct,matdate,couponvalue,couponpercent,issuer)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (secid,boardid,shortname,secname,isin,facevalue,prevprice,yield_pct,matdate,couponvalue,couponpercent,couponperiod,issuer)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             [
                 (
                     r.secid,
@@ -177,6 +194,7 @@ def upsert_bonds(rows: List[BondRow]) -> None:
                     r.matdate,
                     r.couponvalue,
                     r.couponpercent,
+                    r.couponperiod,
                     r.issuer,
                 )
                 for r in rows
@@ -187,26 +205,71 @@ def upsert_bonds(rows: List[BondRow]) -> None:
 
 
 def screen(min_yield: float, max_price_pct: float) -> List[Dict[str, Any]]:
-    query = """
-    SELECT b.secid, b.boardid, b.shortname, b.secname, b.prevprice, b.yield_pct,
-           b.facevalue, b.matdate, b.couponpercent, b.couponvalue, b.issuer,
-           COALESCE(r.rating_group, 'UNSPECIFIED') AS rating_group,
-           (100 - b.prevprice) AS discount_from_par
-    FROM moex_bonds_raw b
-    LEFT JOIN issuer_ratings r ON r.issuer = b.issuer
-    WHERE b.prevprice IS NOT NULL
-      AND b.yield_pct IS NOT NULL
-      AND b.prevprice <= ?
-      AND b.yield_pct >= ?
-      AND b.prevprice > 0
-    ORDER BY rating_group, b.prevprice ASC
+    """Отбор с перерасчётом эффективной доходности.
+
+    Правила:
+      1. Определяем price_percent: если prevprice <=150 -> это уже % от номинала, иначе prevprice/facevalue*100.
+      2. discount_from_par = 100 - price_percent.
+      3. Базовая доходность: yield_pct (если не None и >0). Если отсутствует и разрешён fallback — считаем текущую (current yield)
+         current_yield = annual_coupon_cash / price_abs * 100.
+         annual_coupon_cash = couponvalue * (365/couponperiod) ИЛИ (facevalue * couponpercent/100)*(365/couponperiod) если couponvalue отсутствует.
+      4. Отбор: price_percent <= max_price_pct И effective_yield >= min_yield.
     """
+    use_fallback = os.getenv("BONDS_USE_FALLBACK_YIELD", "1").lower() in {"1","true","yes"}
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
-        cur.execute(query, (max_price_pct, min_yield))
-        cols = [d[0] for d in cur.description]
+        cur.execute(
+            """SELECT b.secid,b.boardid,b.shortname,b.secname,b.isin,b.prevprice,b.yield_pct,b.facevalue,
+                       b.matdate,b.couponpercent,b.couponvalue,b.couponperiod,b.issuer,
+                       COALESCE(r.rating_group,'UNSPECIFIED') as rating_group
+                FROM moex_bonds_raw b
+                LEFT JOIN issuer_ratings r ON r.issuer=b.issuer
+            """
+        )
         rows = cur.fetchall()
-    return [dict(zip(cols, r)) for r in rows]
+        cols = [d[0] for d in cur.description]
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        rec = dict(zip(cols, row))
+        prevprice = rec.get("prevprice")
+        face = rec.get("facevalue") or 1000
+        price_percent = None
+        if isinstance(prevprice, (int, float)) and prevprice is not None:
+            if prevprice <= 150:
+                price_percent = float(prevprice)
+            else:
+                try:
+                    price_percent = (float(prevprice) / float(face)) * 100 if face else None
+                except Exception:
+                    price_percent = None
+        if price_percent is None:
+            continue
+        discount_from_par = 100 - price_percent if price_percent is not None else None
+        couponperiod = rec.get("couponperiod")
+        couponvalue = rec.get("couponvalue")
+        couponpercent = rec.get("couponpercent")
+        yield_pct = rec.get("yield_pct")
+        effective_yield = yield_pct if isinstance(yield_pct, (int, float)) and yield_pct is not None else None
+        price_abs = price_percent / 100 * face if (price_percent is not None and face) else None
+        if (effective_yield is None or effective_yield < min_yield) and use_fallback and price_abs and couponperiod and couponperiod > 0:
+            annual_coupon_cash = None
+            if isinstance(couponvalue, (int, float)) and couponvalue:
+                annual_coupon_cash = couponvalue * (365 / couponperiod)
+            elif isinstance(couponpercent, (int, float)) and couponpercent:
+                annual_coupon_cash = face * (couponpercent / 100) * (365 / couponperiod)
+            if annual_coupon_cash and price_abs > 0:
+                effective_yield = annual_coupon_cash / price_abs * 100
+        if price_percent <= max_price_pct and effective_yield is not None and effective_yield >= min_yield:
+            rec.update({
+                "price_percent": price_percent,
+                "discount_from_par": discount_from_par,
+                "effective_yield": effective_yield,
+                "price_abs": price_abs,
+            })
+            out.append(rec)
+    # сортировка: сначала рейтинг, потом цена
+    out.sort(key=lambda r: (r.get("rating_group"), r.get("price_percent")))
+    return out
 
 
 def print_grouped(items: List[Dict[str, Any]]) -> None:
@@ -219,13 +282,11 @@ def print_grouped(items: List[Dict[str, Any]]) -> None:
         groups.setdefault(it["rating_group"], []).append(it)
     for grp, rows in sorted(groups.items(), key=lambda kv: kv[0]):
         print(f"\nРейтинг группа: {grp} (кол-во: {len(rows)})")
-        print("SECID  Price%  Yield%  Disc%  Maturity  Coupon%  Issuer")
+        print("SECID     Price%  EffY%  Disc%  MatDate    Cup%  Period  Issuer")
         for r in rows:
-            print(
-                f"{r['secid']:<8} {r['prevprice'] or 0:6.2f} {r['yield_pct'] or 0:6.2f} "
-                f"{r['discount_from_par'] or 0:6.2f} {str(r['matdate'] or '')[:10]:<10} "
-                f"{(r['couponpercent'] or 0):7.2f} {str(r['issuer'] or '')[:40]}"
-            )
+            print(f"{r.get('secid',''):<9} {r.get('price_percent',0):6.2f} {r.get('effective_yield',0):6.2f} "
+                  f"{r.get('discount_from_par',0):6.2f} {str(r.get('matdate','') or '')[:10]:<10} "
+                  f"{(r.get('couponpercent') or 0):6.2f} {str(r.get('couponperiod') or ''):>6}  {str(r.get('issuer') or '')[:34]}")
 
 
 def export_csv(items: List[Dict[str, Any]], fname: str = "bonds_screen.csv") -> None:
