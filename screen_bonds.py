@@ -17,8 +17,9 @@
 Параметры окружения:
   BONDS_BOARDS=TQOB,TQCB  (список досок, запятая)
   BONDS_MIN_YIELD=20
-  BONDS_MAX_PRICE_PCT=80   (максимальный PREVPRICE, чтобы считалось 20% ниже номинала)
-  BONDS_EXPORT_CSV=1       (экспорт результата в bonds_screen.csv)
+    BONDS_MAX_PRICE_PCT=90   (максимальный PREVPRICE, чтобы считалось 10% ниже номинала)
+    BONDS_EXPORT_CSV=1       (экспорт результата в bonds_screen.csv)
+    BONDS_EXPORT_XLSX=1      (экспорт результата в bonds_screen.xlsx)
 """
 from __future__ import annotations
 
@@ -249,11 +250,25 @@ def main() -> None:
         all_rows.extend(fetch_board(b))
     upsert_bonds(all_rows)
     min_yield = float(os.getenv("BONDS_MIN_YIELD", "20"))
-    max_price_pct = float(os.getenv("BONDS_MAX_PRICE_PCT", "80"))
+    # 10% ниже номинала => цена <= 90
+    max_price_pct = float(os.getenv("BONDS_MAX_PRICE_PCT", "90"))
     filtered = screen(min_yield=min_yield, max_price_pct=max_price_pct)
     print_grouped(filtered)
     if os.getenv("BONDS_EXPORT_CSV", "0").lower() in {"1","true","yes"}:
         export_csv(filtered)
+    if os.getenv("BONDS_EXPORT_XLSX", "1").lower() in {"1","true","yes"}:
+        try:
+            from openpyxl import Workbook
+            wb = Workbook(); ws = wb.active; ws.title = "Screen"
+            if filtered:
+                cols = list(filtered[0].keys())
+                ws.append(cols)
+                for row in filtered:
+                    ws.append([row.get(c) for c in cols])
+            wb.save("bonds_screen.xlsx")
+            logging.info("Экспортирован отбор облигаций -> bonds_screen.xlsx (rows=%s)", len(filtered))
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Не удалось экспортировать в Excel: %s", exc)
 
 
 if __name__ == "__main__":  # pragma: no cover
