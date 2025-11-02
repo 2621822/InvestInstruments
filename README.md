@@ -333,6 +333,32 @@ schtasks /Create /SC DAILY /ST 07:30 /TN InvestDailyHistory /TR "powershell.exe 
 * `idx_targets_uid_date` на `(uid, recommendationDate DESC)` – быстрый доступ к последним таргетам (поддерживает выборку множества записей после расширения схемы).
 * `idx_instrument_potentials_rel` для топ‑N потенциалов.
 
+## Избранные акции (Favorites)
+
+Модуль `favorites.py` позволяет получить список избранных инструментов из вашего профиля Tinkoff Invest через официальный SDK.
+
+Функции:
+* `list_favorites()` – вернуть сырой список избранных инструментов.
+* `list_favorite_shares()` – только акции в компактном формате (ticker, uid, figi, name...).
+* `ensure_perspective_from_favorites()` – добавить отсутствующие избранные акции в таблицу `perspective_shares`.
+
+CLI скрипт `list_favorites.py`:
+```powershell
+python list_favorites.py            # вывести список избранных акций
+python list_favorites.py --add      # также добавить новые в perspective_shares
+```
+
+Токен берётся из `INVEST_TOKEN` / `INVEST_TINKOFF_TOKEN` или файла `tinkoff_token.txt`.
+Если токен отсутствует – выводится предупреждение и список будет пуст.
+
+Пример кода:
+```python
+from invest_core.favorites import list_favorite_shares
+shares = list_favorite_shares()
+for s in shares:
+  print(s['ticker'], s['uid'])
+```
+
 ## Статус legacy
 
 REST модуль `tinkoff_api.py` и ранняя SDK-обёртка `tinkoff_sdk.py` заменены новыми компонентами и оставлены как заглушки.
