@@ -105,7 +105,7 @@ def run(
         _append_log(
             'DailyUnified board={board} hist_status={hstatus} hist_fetched={hfetched} hist_inserted={hins} hist_duplicates={hdup} '
             'cons_processed={cproc} cons_cins={cins} cons_cdup={cdup} targets_inserted={tins} targets_dups={tdup} '
-            'pot_processed={pproc} pot_inserted={pins} pot_skipped={pskip} retention_deleted={rdel} top_rows={trows} duration={dur}s'.format(
+            'pot_processed={pproc} pot_inserted={pins} pot_skipped={pskip} pot_unchanged={punch} retention_deleted={rdel} top_rows={trows} duration={dur}s'.format(
                 board=board,
                 hstatus=res_hist.get('status'),
                 hfetched=res_hist.get('fetched'),
@@ -119,6 +119,7 @@ def run(
                 pproc=res_pot.get('processed'),
                 pins=res_pot.get('inserted'),
                 pskip=res_pot.get('skipped'),
+                punch=res_pot.get('unchanged'),
                 rdel=res_ret.get('deleted'),
                 trows=(res_top.get('rows') if isinstance(res_top.get('rows'), int) else None),
                 dur=dur,

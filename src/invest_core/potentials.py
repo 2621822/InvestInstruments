@@ -230,6 +230,45 @@ def CalculateSharesPotential(secid: str, uid: str, ticker: str | None = None, *,
             rel = (consensus_price - prev_close) / prev_close
         except Exception:
             rel = None
+    # Проверка последней сохранённой записи для uid, чтобы не копить дубли при неизменном rel
+    last_row: Dict[str, Any] | None = None
+    last_rel: float | None = None
+    with db_layer.get_connection() as _c:
+        cur = _c.execute(
+            "SELECT computedAt, prevClose, consensusPrice, pricePotentialRel FROM shares_potentials WHERE uid = ? ORDER BY computedAt DESC LIMIT 1",
+            (uid,)
+        )
+        r = cur.fetchone()
+        if r:
+            last_row = {
+                "computedAt": r[0],
+                "prevClose": r[1],
+                "consensusPrice": r[2],
+                "pricePotentialRel": r[3],
+            }
+            last_rel = r[3]
+    unchanged = False
+    # Если последний относительный потенциал совпадает с новым (учитываем небольшую плавающую погрешность)
+    if last_rel is not None and rel is not None:
+        # Допускаем расхождение до 1e-9 (float арифметика)
+        if abs(last_rel - rel) < 1e-9:
+            unchanged = True
+    # Если оба None (rel не рассчитывается) считаем что дубли не критичны, но можем пропустить при skip_null
+    if last_rel is None and rel is None:
+        # Не считаем как unchanged для метрики inserted/ skipped, но дадим возможность skip_null пропустить
+        pass
+    if unchanged:
+        return {
+            "uid": uid,
+            "secid": secid,
+            "ticker": ticker,
+            "computedAt": now_ts,
+            "prevClose": prev_close,
+            "consensusPrice": consensus_price,
+            "pricePotentialRel": rel,
+            "skipped": True,
+            "unchanged": True,
+        }
     if skip_null and (rel is None):
         # Пропуск вставки, возвращаем только вычисленные значения
         return {
@@ -272,8 +311,9 @@ def FillingPotentialData(*, skip_null: bool = False) -> Dict[str, Any]:
     """Ежедневный обход перспективных акций и расчёт их потенциала в shares_potentials."""
     db_layer.init_schema()
     processed = 0
-    inserted = 0  # считаем скольким удалось рассчитать ненулевой rel
-    skipped = 0   # у скольких rel = NULL
+    inserted = 0      # сколько вставок (новых или изменившихся rel)
+    skipped = 0       # rel = NULL (и пропущено по skip_null)
+    unchanged = 0     # сколько пропущено из-за отсутствия изменения rel
     rows: list[Dict[str, Any]] = []
     with db_layer.get_connection() as conn:
         cur = conn.execute("SELECT uid, secid, ticker FROM perspective_shares WHERE uid IS NOT NULL AND secid IS NOT NULL")
@@ -282,14 +322,26 @@ def FillingPotentialData(*, skip_null: bool = False) -> Dict[str, Any]:
         processed += 1
         res = CalculateSharesPotential(secid=secid, uid=uid, ticker=ticker, skip_null=skip_null)
         rows.append(res)
-        if res.get("pricePotentialRel") is None:
-            skipped += 1
+        if res.get("unchanged"):
+            unchanged += 1
         else:
-            inserted += 1
+            if res.get("pricePotentialRel") is None:
+                # Если rel = None и была реально вставка (skip_null=False), считаем в skipped
+                skipped += 1 if res.get("skipped") or skip_null else 0
+                if not res.get("skipped") and not skip_null:
+                    # Вставлена запись с NULL rel
+                    inserted += 1
+            else:
+                if res.get("skipped"):
+                    # Это случай skip_null=True для валидного rel? Теоретически не должно происходить
+                    skipped += 1
+                else:
+                    inserted += 1
     return {
         "processed": processed,
         "inserted": inserted,
         "skipped": skipped,
+        "unchanged": unchanged,
         "rows": rows,
     }
 
