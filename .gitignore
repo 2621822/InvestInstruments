@@ -1,3 +1,9 @@
+# Project invest venv
+invest/
+# Local db files
+*.db
+# Backup archives
+backup_*.zip
 # Python cache
 __pycache__/
 *.pyc
