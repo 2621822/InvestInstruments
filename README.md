@@ -242,9 +242,9 @@ print(maintenance_report)
 
 Лог пишется в `daily_history_job.log`. Для взаимного исключения применяется файловая блокировка `daily_history_job.lock`.
 
-Пример запуска по умолчанию:
+Пример запуска по умолчанию (теперь увеличенный горизонт хранения 1100 дней):
 ```powershell
-python daily_history_job.py --retention-days 90 --top 10
+python daily_history_job.py --retention-days 1100 --top 10
 ```
 
 Доступные аргументы CLI:
@@ -252,7 +252,7 @@ python daily_history_job.py --retention-days 90 --top 10
 * `--skip-history` – пропустить шаг догрузки истории.
 * `--skip-consensus` – пропустить шаг загрузки консенсусов/таргетов.
 * `--skip-potentials` – пропустить расчёт потенциалов и связанные шаги.
-* `--retention-days 90` – удалить потенциалы старше указанного количества дней (0 отключает очистку).
+* `--retention-days 1100` – удалить потенциалы старше указанного количества дней (0 отключает очистку; значение по умолчанию = 1100).
 * `--top 10` – вывести топ-N потенциалов в лог после пересчёта.
 * `--no-skip-null` – вставлять строки потенциалов даже если относительный потенциал не рассчитан (по умолчанию такие строки пропускаются).
 
@@ -301,7 +301,7 @@ $env:INVEST_MOEX_BOARD = 'TQBR'
 ```powershell
 $env:INVEST_MOEX_BOARD = 'TQBR'
 cd 'D:\#Work\#Invest\Project'
-& 'D:\#Work\#Invest\Project\invest\Scripts\python.exe' .\daily_history_job.py --retention-days 90 --top 10
+& 'D:\#Work\#Invest\Project\invest\Scripts\python.exe' .\daily_history_job.py --retention-days 1100 --top 10
 ```
 
 Тогда в schtasks:

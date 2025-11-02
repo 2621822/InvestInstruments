@@ -149,7 +149,7 @@ if __name__ == '__main__':
     parser.add_argument('--skip-history', action='store_true', help='Пропустить загрузку истории MOEX')
     parser.add_argument('--skip-consensus', action='store_true', help='Пропустить загрузку консенсусов')
     parser.add_argument('--skip-potentials', action='store_true', help='Пропустить расчёт потенциалов')
-    parser.add_argument('--retention-days', type=int, default=90, help='Очистить потенциалы старше этого количества дней (0=нет)')
+    parser.add_argument('--retention-days', type=int, default=1100, help='Очистить потенциалы старше этого количества дней (0=нет, default 1100)')
     parser.add_argument('--top', type=int, default=None, help='Вывести топ-N потенциалов после пересчёта')
     parser.add_argument('--no-skip-null', action='store_true', help='Вставлять строки потенциалов с NULL rel')
     parser.add_argument('--collapse-duplicates', action='store_true', help='Удалить исторические дубли неизменного потенциала')
