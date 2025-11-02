@@ -19,3 +19,4 @@ __pycache__/
 
 # Virtual environments
 .venv/
+tinkoff_token.txt
