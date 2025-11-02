@@ -24,6 +24,7 @@ from invest_core.potentials import (
     FillingPotentialData,
     CleanOldSharePotentials,
     GetTopSharePotentials,
+    CollapseDuplicateSharePotentials,
 )  # noqa: E402
 from invest_core.forecasts import FillingConsensusData  # noqa: E402
 from invest_core import db as db_layer  # noqa: E402
@@ -66,6 +67,7 @@ def run(
     retention_days: int = 90,
     top_limit: int | None = None,
     skip_null_potentials: bool = True,
+    collapse_duplicates: bool = False,
 ):
     """Запуск единого процесса обновления.
 
@@ -89,6 +91,7 @@ def run(
         res_pot = {"status": "skipped"}
         res_ret = {"status": "skipped"}
         res_top = {"status": "skipped"}
+        res_collapse = {"status": "skipped"}
 
         if not skip_history:
             res_hist = FillingMoexHistory(board=board)
@@ -99,13 +102,15 @@ def run(
             res_pot = FillingPotentialData(skip_null=skip_null_potentials)
             if retention_days and retention_days > 0:
                 res_ret = CleanOldSharePotentials(max_age_days=retention_days)
+            if collapse_duplicates:
+                res_collapse = CollapseDuplicateSharePotentials()
             if top_limit and top_limit > 0:
                 res_top = GetTopSharePotentials(limit=top_limit)
         dur = round(time.time() - start, 3)
         _append_log(
             'DailyUnified board={board} hist_status={hstatus} hist_fetched={hfetched} hist_inserted={hins} hist_duplicates={hdup} '
             'cons_processed={cproc} cons_cins={cins} cons_cdup={cdup} targets_inserted={tins} targets_dups={tdup} '
-            'pot_processed={pproc} pot_inserted={pins} pot_skipped={pskip} pot_unchanged={punch} retention_deleted={rdel} top_rows={trows} duration={dur}s'.format(
+            'pot_processed={pproc} pot_inserted={pins} pot_skipped={pskip} pot_unchanged={punch} retention_deleted={rdel} collapse_deleted={cdel} top_rows={trows} duration={dur}s'.format(
                 board=board,
                 hstatus=res_hist.get('status'),
                 hfetched=res_hist.get('fetched'),
@@ -121,6 +126,7 @@ def run(
                 pskip=res_pot.get('skipped'),
                 punch=res_pot.get('unchanged'),
                 rdel=res_ret.get('deleted'),
+                cdel=res_collapse.get('deleted'),
                 trows=(res_top.get('rows') if isinstance(res_top.get('rows'), int) else None),
                 dur=dur,
             )
@@ -146,6 +152,7 @@ if __name__ == '__main__':
     parser.add_argument('--retention-days', type=int, default=90, help='Очистить потенциалы старше этого количества дней (0=нет)')
     parser.add_argument('--top', type=int, default=None, help='Вывести топ-N потенциалов после пересчёта')
     parser.add_argument('--no-skip-null', action='store_true', help='Вставлять строки потенциалов с NULL rel')
+    parser.add_argument('--collapse-duplicates', action='store_true', help='Удалить исторические дубли неизменного потенциала')
     args = parser.parse_args()
     run(
         board=args.board,
@@ -155,4 +162,5 @@ if __name__ == '__main__':
         retention_days=args.retention_days,
         top_limit=args.top,
         skip_null_potentials=(not args.no_skip_null),
+        collapse_duplicates=args.collapse_duplicates,
     )

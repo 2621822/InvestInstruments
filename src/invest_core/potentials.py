@@ -163,7 +163,7 @@ __all__ = [                                            # Экспортируе�
     "FillingPotentialData",
     "CleanOldSharePotentials",
     "GetTopSharePotentials",
-    "CleanDuplicateSharePotentials",
+    "CollapseDuplicateSharePotentials",
 ]
 
 # ===================== НОВЫЕ ФУНКЦИИ ПО СПЕЦИФИКАЦИИ =====================
@@ -429,89 +429,62 @@ def GetTopSharePotentials(limit: int = 10, *, max_age_days: int | None = None,
     return {"status": "ok", "rows": len(data), "data": data, "limit": limit}
 
 
-def CleanDuplicateSharePotentials(epsilon: float = 1e-9, *, keep_last: bool = True) -> Dict[str, Any]:
-    """Удалить логические дубли из shares_potentials.
+def CollapseDuplicateSharePotentials(*, rel_epsilon: float = 1e-9) -> Dict[str, Any]:
+    """Удалить исторические дубли потенциалов для каждого uid, оставив только записи
+    при изменении `pricePotentialRel` больше заданного порога.
 
-    Дубликат определяется как запись для uid с тем же pricePotentialRel (|diff| < epsilon),
-    где существует более поздняя запись с тем же значением.
+    Логика:
+      1. Берём все записи по uid упорядоченные по computedAt ASC.
+      2. Считаем предыдущую "валидную" величину rel (NULL не обновляет эталон).
+      3. Если новая запись имеет rel и |rel - prev_rel| < rel_epsilon, помечаем её на удаление.
+      4. NULL rel сохраняем только первую подряд серию (прочие подряд NULL можно удалить для экономии).
 
-    Алгоритм:
-      1. Находим все uid, для которых есть >=2 записей с ненулевым (в смысле not NULL) rel.
-      2. Для каждого uid выбираем группы по rel (округление / сравнение с допуском).
-      3. В каждой группе оставляем только самую позднюю запись (MAX computedAt), остальные удаляем.
-      4. Отдельно по записям с NULL rel: можно оставить только самую последнюю (если их много), чтобы сократить шум.
-
-    Параметры:
-      epsilon: допуск сравнения значений rel.
-      keep_last: если True – оставляем последнюю запись в каждой группе; если False – первую.
-
-    Возвращает словарь со статистикой: {deleted, groups, uids, null_collapsed}.
+    Возвращает статистику: deleted, scanned_uids, scanned_rows.
     """
     db_layer.init_schema()
-    deleted_total = 0
-    groups_total = 0
-    affected_uids: list[str] = []
-    null_collapsed = 0
+    deleted = 0
+    scanned_rows = 0
+    scanned_uids = 0
     with db_layer.get_connection() as conn:
-        # Получаем все записи (uid, computedAt, rel, rowid) – rowid для sqlite облегчает удаление
-        cur = conn.execute("SELECT uid, computedAt, pricePotentialRel FROM shares_potentials")
-        rows = cur.fetchall()
-        by_uid: dict[str, list[tuple[str, str, float | None]]] = {}
-        for uid, computedAt, rel in rows:
-            by_uid.setdefault(uid, []).append((uid, computedAt, rel))
-        for uid, items in by_uid.items():
-            # Сортируем по времени чтобы было проще выбирать последнюю
-            items.sort(key=lambda x: x[1])
-            # Группы по rel (с epsilon). Используем список групп: каждая группа = [indices]
-            groups: list[list[int]] = []
-            rel_values: list[float | None] = []
-            for idx, (_, _, rel) in enumerate(items):
-                placed = False
+        # Получаем список uid имеющих более одной записи
+        cur = conn.execute("SELECT uid FROM shares_potentials GROUP BY uid HAVING COUNT(*) > 1")
+        uid_rows = [r[0] for r in cur.fetchall()]
+        for uid in uid_rows:
+            scanned_uids += 1
+            c2 = conn.execute(
+                "SELECT computedAt, pricePotentialRel, rowid FROM shares_potentials WHERE uid = ? ORDER BY computedAt ASC",
+                (uid,)
+            )
+            rows = c2.fetchall()
+            scanned_rows += len(rows)
+            prev_rel: float | None = None
+            first_null_kept = False
+            to_delete_rowids: list[int] = []
+            for computedAt, rel, rowid in rows:
                 if rel is None:
-                    continue  # NULL группы обрабатываем отдельно
-                for g_i, g in enumerate(groups):
-                    ref_rel = rel_values[g_i]
-                    if ref_rel is not None and abs(ref_rel - rel) < epsilon:
-                        g.append(idx)
-                        placed = True
-                        break
-                if not placed:
-                    groups.append([idx])
-                    rel_values.append(rel)
-            # Удаляем лишние в группах с >1 элементом
-            for g_i, g in enumerate(groups):
-                if len(g) <= 1:
+                    # Сохраняем первый NULL, последующие подряд удаляем
+                    if first_null_kept:
+                        to_delete_rowids.append(rowid)
+                    else:
+                        first_null_kept = True
                     continue
-                groups_total += 1
-                affected_uids.append(uid)
-                # Определяем индекс записи которую оставляем
-                keep_idx = max(g) if keep_last else min(g)
-                for idx in g:
-                    if idx == keep_idx:
-                        continue
-                    # Удаляем запись по (uid, computedAt)
-                    _, computedAt, rel_val = items[idx]
-                    conn.execute("DELETE FROM shares_potentials WHERE uid = ? AND computedAt = ?", (uid, computedAt))
-                    deleted_total += 1
-            # COLLAPSE NULL rel (оставляем только последнюю если их >1)
-            null_indices = [i for i, (_, _, rel) in enumerate(items) if rel is None]
-            if len(null_indices) > 1:
-                # Оставить последнюю
-                keep_null = max(null_indices)
-                for idx in null_indices:
-                    if idx == keep_null:
-                        continue
-                    _, computedAt, _rel_val = items[idx]
-                    conn.execute("DELETE FROM shares_potentials WHERE uid = ? AND computedAt = ?", (uid, computedAt))
-                    deleted_total += 1
-                    null_collapsed += 1
+                if prev_rel is None:
+                    prev_rel = rel
+                    continue
+                # Сравнение с предыдущим валидным rel
+                if abs(rel - prev_rel) < rel_epsilon:
+                    to_delete_rowids.append(rowid)
+                else:
+                    prev_rel = rel
+            if to_delete_rowids:
+                # Удаляем батчем
+                conn.executemany("DELETE FROM shares_potentials WHERE rowid = ?", [(rid,) for rid in to_delete_rowids])
+                deleted += len(to_delete_rowids)
         if db_layer.BACKEND == "sqlite":
             conn.commit()
     return {
-        "deleted": deleted_total,
-        "groups": groups_total,
-        "uids": list(set(affected_uids)),
-        "null_collapsed": null_collapsed,
-        "epsilon": epsilon,
-        "keep_last": keep_last,
+        "deleted": deleted,
+        "scanned_uids": scanned_uids,
+        "scanned_rows": scanned_rows,
+        "rel_epsilon": rel_epsilon,
     }
