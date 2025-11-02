@@ -230,9 +230,33 @@ print(maintenance_report)
 
 Если нужен чистый изолированный контекст без файла, можно использовать URI `file:memdb1?mode=memory&cache=shared` (shared-cache), но это усложняет настройку. Текущий репозиторий стандартизирован на временных файлах для тестов.
 
-## Ежедневный запуск FillingMoexHistory
+## Единый ежедневный job (история + консенсус + потенциалы)
 
-Скрипт `daily_history_job.py` выполняет догрузку недостающей истории для всех SECID в `perspective_shares` и пишет лог в `daily_history_job.log`. Использует простую файловую блокировку `daily_history_job.lock`.
+Скрипт `daily_history_job.py` теперь объединяет несколько шагов обновления данных:
+
+1. Догрузка недостающей истории цен MOEX для всех SECID в `perspective_shares` (`FillingMoexHistory`).
+2. Загрузка консенсусов и таргетов для перспективных инструментов (`FillingConsensusData`).
+3. Пересчёт потенциалов акций на основе последних цен и консенсусов (`FillingPotentialData`).
+4. Очистка устаревших записей потенциалов старше N дней (`CleanOldSharePotentials`).
+5. (Опционально) Вывод топ-N записей по относительному потенциалу (`GetTopSharePotentials`).
+
+Лог пишется в `daily_history_job.log`. Для взаимного исключения применяется файловая блокировка `daily_history_job.lock`.
+
+Пример запуска по умолчанию:
+```powershell
+python daily_history_job.py --retention-days 90 --top 10
+```
+
+Доступные аргументы CLI:
+* `--board TQBR` – торговая доска MOEX (по умолчанию значение из переменной окружения или `TQBR`).
+* `--skip-history` – пропустить шаг догрузки истории.
+* `--skip-consensus` – пропустить шаг загрузки консенсусов/таргетов.
+* `--skip-potentials` – пропустить расчёт потенциалов и связанные шаги.
+* `--retention-days 90` – удалить потенциалы старше указанного количества дней (0 отключает очистку).
+* `--top 10` – вывести топ-N потенциалов в лог после пересчёта.
+* `--no-skip-null` – вставлять строки потенциалов даже если относительный потенциал не рассчитан (по умолчанию такие строки пропускаются).
+
+Строка сводки в логе содержит агрегированные метрики: статус шагов, fetched/inserted/duplicates для истории и консенсусов, processed/inserted/skipped для потенциалов, количество удалённых старых записей и число строк в топ‑N.
 
 ### Windows Task Scheduler (schtasks)
 
@@ -277,7 +301,7 @@ $env:INVEST_MOEX_BOARD = 'TQBR'
 ```powershell
 $env:INVEST_MOEX_BOARD = 'TQBR'
 cd 'D:\#Work\#Invest\Project'
-& 'D:\#Work\#Invest\Project\invest\Scripts\python.exe' .\daily_history_job.py
+& 'D:\#Work\#Invest\Project\invest\Scripts\python.exe' .\daily_history_job.py --retention-days 90 --top 10
 ```
 
 Тогда в schtasks:
