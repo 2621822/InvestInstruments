@@ -202,6 +202,7 @@ def init_schema():
             _safe_exec(conn, "CREATE INDEX IF NOT EXISTS idx_instrument_potentials_rel ON instrument_potentials(pricePotentialRel)", skip_on_lock=True)
             _safe_exec(conn, "CREATE INDEX IF NOT EXISTS idx_shares_potentials_rel ON shares_potentials(pricePotentialRel)", skip_on_lock=True)
             _safe_exec(conn, "CREATE INDEX IF NOT EXISTS idx_shares_potentials_uid_computedAt ON shares_potentials(uid, computedAt)", skip_on_lock=True)
+            _safe_exec(conn, "CREATE INDEX IF NOT EXISTS idx_shares_potentials_uid_rel ON shares_potentials(uid, pricePotentialRel)", skip_on_lock=True)
             _SCHEMA_INITIALIZED = True
         if BACKEND == "sqlite":
             conn.commit()
