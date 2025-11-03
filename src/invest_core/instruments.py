@@ -5,8 +5,8 @@
 Функции:
   search_share(query)        – поиск инструмента (акция) по текстовому запросу.
   get_instrument(uid)        – получить подробности инструмента по UID.
-  ensure_perspective_share(uid_or_query) – добавить бумагу в perspective_shares.
-  enrich_all_perspective()   – обновить отсутствующие поля для всех бумаг.
+    ensure_perspective_share(uid_or_query) – добавить бумагу в perspective_shares.
+    fill_all_perspective_shares() – массовое обновление атрибутов всех бумаг.
 
 Использует слой БД из db.py и обёртки клиента из sdk_client.py.
 Все строки прокомментированы.
@@ -114,43 +114,16 @@ def ensure_perspective_share(uid_or_query: str) -> Dict[str, Any]:
     return {"status": "inserted", "uid": inst["uid"], "ticker": inst["ticker"]}
 
 
-def enrich_all_perspective() -> Dict[str, Any]:
-    """Проход по perspective_shares: заполнить отсутствующие атрибуты.
-    Возвращает статистику checked/updated.
-    """
-    db_layer.init_schema()                        # Убедиться что таблица существует
-    checked = 0                                   # Счётчик проверенных строк
-    updated = 0                                   # Счётчик обновлённых строк
-    with db_layer.get_connection() as conn:       # Открываем соединение
-        cur = conn.execute("SELECT uid, ticker, name, secid, isin, figi, classCode, instrumentType, assetUid FROM perspective_shares")
-        rows = cur.fetchall()                     # Получаем все строки
-        for r in rows:                            # Итерация по строкам
-            checked += 1                          # Инкремент проверенных
-            uid, ticker, name, secid, isin, figi, classCode, instrumentType, assetUid = r  # Распаковка
-            if all([ticker, name, secid, isin, figi, classCode, instrumentType, assetUid]):  # Полнота
-                continue                          # Если всё заполнено – пропускаем
-            inst = get_instrument(uid)            # Получаем свежие данные из SDK
-            if not inst:                          # Если не удалось
-                log.debug("Skip enrich uid=%s (not found via SDK)", uid)
-                continue
-            sql = ("UPDATE perspective_shares SET ticker=?, name=?, secid=?, isin=?, figi=?, classCode=?, instrumentType=?, assetUid=? WHERE uid=?")
-            conn.execute(sql, (
-                inst.get("ticker"), inst.get("name"), inst.get("secid"), inst.get("isin"), inst.get("figi"),
-                inst.get("classCode"), inst.get("instrumentType"), inst.get("assetUid"), uid
-            ))
-            updated += 1                          # Инкремент обновлений
-        if db_layer.BACKEND == "sqlite":         # Коммит для sqlite
-            conn.commit()
-    return {"checked": checked, "updated": updated}  # Возвращаем статистику
 
 
 __all__ = [  # Экспорт публичного API модуля
     "search_share",
     "get_instrument",
     "ensure_perspective_share",
-    "enrich_all_perspective",
     "verify_perspective_uids",
     "get_uid_instrument",
+    "FillingSharesData",
+    "fill_all_perspective_shares",
 ]
 
 
@@ -215,3 +188,50 @@ def get_uid_instrument(ticker: str) -> Optional[str]:
         if cand_ticker and cand_ticker.upper() == ticker.upper() and (cand_type and (cand_type in share_types or str(cand_type).lower() == "share")):
             return getattr(cand, "uid", None)
     return None
+
+
+def FillingSharesData(uid: str) -> Dict[str, Any]:
+	"""Заполнить (обновить) одну запись в perspective_shares по UID.
+
+	Действия:
+	  1. Получить инструмент через get_instrument(uid).
+	  2. Если не найден – вернуть status=not-found.
+	  3. Иначе выполнить UPDATE (ticker,name,secid,isin,figi,classCode,instrumentType,assetUid).
+	  4. Вернуть статус и обновлённые поля.
+	"""
+	inst = get_instrument(uid)
+	if not inst:
+		return {"status": "not-found", "uid": uid}
+	db_layer.init_schema()
+	with db_layer.get_connection() as conn:
+		sql = ("UPDATE perspective_shares SET ticker=?, name=?, secid=?, isin=?, figi=?, classCode=?, instrumentType=?, assetUid=? WHERE uid=?")
+		conn.execute(sql, (
+			inst.get("ticker"), inst.get("name"), inst.get("secid"), inst.get("isin"), inst.get("figi"),
+			inst.get("classCode"), inst.get("instrumentType"), inst.get("assetUid"), uid
+		))
+		if db_layer.BACKEND == "sqlite":
+			conn.commit()
+	return {"status": "updated", "uid": uid, **{k: inst.get(k) for k in ["ticker","name","isin","figi","classCode","instrumentType","assetUid"]}}
+
+
+def fill_all_perspective_shares(limit: Optional[int] = None) -> Dict[str, Any]:
+	"""Последовательно вызвать FillingSharesData для всех UID в perspective_shares.
+
+	limit: ограничить количество UID (для тестов).
+	Возвращает статистику updated/not_found.
+	"""
+	db_layer.init_schema()
+	with db_layer.get_connection() as conn:
+		cur = conn.execute("SELECT uid FROM perspective_shares ORDER BY uid")
+		uids = [r[0] for r in cur.fetchall() if r[0]]
+	if limit is not None:
+		uids = uids[:limit]
+	updated = 0
+	not_found = 0
+	for u in uids:
+		res = FillingSharesData(u)
+		if res["status"] == "updated":
+			updated += 1
+		elif res["status"] == "not-found":
+			not_found += 1
+	return {"total": len(uids), "updated": updated, "not_found": not_found}

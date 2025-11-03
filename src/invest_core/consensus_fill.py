@@ -6,7 +6,7 @@
 Шаги:
   1. Собрать множество SECID из moex_shares_history.
   2. Для каждого SECID убедиться что есть запись в perspective_shares (поиск по ticker).
-  3. Выполнить массовое обогащение атрибутов (enrich_all_perspective).
+    3. Выполнить массовое заполнение атрибутов (fill_all_perspective_shares).
   4. По каждому UID из perspective_shares, имеющему историю, получить детальный forecast_by (консенсус + targets).
   5. Вернуть агрегированную статистику.
 
@@ -49,7 +49,7 @@ def fill_consensus_for_history_shares() -> Dict[str, Any]:
             existed += 1
         elif st == 'not-found':                          # Не удалось найти через SDK search
             not_found += 1
-    enrich_stats = instruments.enrich_all_perspective()  # Массовое обогащение атрибутов
+    enrich_stats = instruments.fill_all_perspective_shares()  # Массовое заполнение атрибутов (бывш. enrich_all_perspective)
     # Сбор UID только для тех SECID, которые реально присутствуют и имели историю
     db_layer.init_schema()                               # Повторная инициализация (на случай новых вставок)
     uid_list = []                                        # Список UID для прогнозов
