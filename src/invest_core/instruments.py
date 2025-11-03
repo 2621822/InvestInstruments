@@ -150,6 +150,7 @@ __all__ = [  # Экспорт публичного API модуля
     "ensure_perspective_share",
     "enrich_all_perspective",
     "verify_perspective_uids",
+    "get_uid_instrument",
 ]
 
 
@@ -189,3 +190,28 @@ def verify_perspective_uids(limit: int | None = None) -> Dict[str, Any]:
         'uids_reachable': reachable,
         'uids_unreachable': unreachable,
     }
+
+
+def get_uid_instrument(ticker: str) -> Optional[str]:
+    """Получить UID инструмента акции по точному совпадению тикера.
+
+    Выполняет поиск через search_share (который возвращает первый объект share),
+    но для точности вызываем исходный низкоуровневый поиск find_instrument напрямую,
+    фильтруем список по instrument_type in {'share','INSTRUMENT_TYPE_SHARE'} и
+    точному совпадению поля ticker.
+
+    Возвращает UID или None.
+    """
+    from . import sdk_client
+    resp = sdk_client.find_instrument(query=ticker)
+    items = getattr(resp, "instruments", None) or getattr(resp, "items", None) or []
+    if not items:
+        return None
+    share_types = {"share", "INSTRUMENT_TYPE_SHARE", "SHARE"}
+    for it in items:
+        cand = getattr(it, "instrument", None) or it
+        cand_ticker = getattr(cand, "ticker", None)
+        cand_type = getattr(cand, "instrument_type", None) or getattr(cand, "instrumentType", None)
+        if cand_ticker and cand_ticker.upper() == ticker.upper() and (cand_type and (cand_type in share_types or str(cand_type).lower() == "share")):
+            return getattr(cand, "uid", None)
+    return None
