@@ -53,12 +53,22 @@ def search_share(query: str) -> Optional[Dict[str, Any]]:
     resp = sdk_client.find_instrument(query=query)
     # В ответе SDK ожидается поле instruments/items.
     items = getattr(resp, "instruments", None) or getattr(resp, "items", None) or []
-    if not items:                                # Если список пуст – ничего не найдено
+    if not items:
         return None
-    first = items[0]                             # Берём первый элемент
-    # Пытаемся извлечь instrument или сам элемент содержит поля.
-    inst = getattr(first, "instrument", None) or first
-    return _normalize_instrument(inst)           # Возвращаем нормализованный dict
+    # Предпочитаем первый элемент с instrument_type == 'share' (возможные варианты регистра / enum знаков)
+    share_types = {"share", "INSTRUMENT_TYPE_SHARE", "SHARE"}
+    chosen = None
+    for it in items:
+        cand = getattr(it, "instrument", None) or it
+        itype = getattr(cand, "instrument_type", None) or getattr(cand, "instrumentType", None)
+        if itype and itype.lower() == "share" or itype in share_types:
+            chosen = cand
+            break
+    if chosen is None:
+        # Фолбек: берём первый элемент
+        first = items[0]
+        chosen = getattr(first, "instrument", None) or first
+    return _normalize_instrument(chosen)
 
 
 def get_instrument(uid: str) -> Optional[Dict[str, Any]]:

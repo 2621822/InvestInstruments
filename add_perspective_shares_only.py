@@ -31,7 +31,7 @@ RAW_TICKERS = [
     "AFKS","SVCB","SNGS","POSI","RTKMP","T","GEMC","DATA","BELU","LEAS","RENI","RAGR","SFIN","ASTR","IRAO","LKOH","SNGSP","MBNK","TRMK","X5","FESH","DIAS","MTLR","WUSH","LENT","OZPH","TATN","YDEX","MSNG","UGLD","ALRS","CHMF","PHOR","PLZL","GMKN","SBER","IVAT","RTKM","ROSN","RUAL","SBERP","AFLT","NVTK","GAZP","MOEX","MTSS","LKOH","HEAD","PLZL","SMLT","SOFL","VSEH"
 ]
 
-SHARE_TYPE = "INSTRUMENT_TYPE_SHARE"  # ожидаемое значение instrumentType для акций
+SHARE_TYPES = {"share", "INSTRUMENT_TYPE_SHARE", "SHARE"}  # допустимые значения типа акции
 
 
 def normalize(tickers: List[str]) -> List[str]:
@@ -57,8 +57,9 @@ def process(limit: int | None, dry_run: bool):
             stats["not_found"] += 1
             rows.append({"ticker": t, "status": "not-found", "type": "", "uid": ""})
             continue
-        itype = inst.get("instrumentType") or inst.get("instrument_type") or ""
-        if itype != SHARE_TYPE:
+        itype = (inst.get("instrumentType") or inst.get("instrument_type") or "")
+        norm_type = itype.upper() if isinstance(itype, str) else ""
+        if not (itype in SHARE_TYPES or norm_type in SHARE_TYPES or itype.lower() == "share"):
             stats["not_share"] += 1
             rows.append({"ticker": t, "status": "not-share", "type": itype, "uid": inst.get("uid","")})
             continue
