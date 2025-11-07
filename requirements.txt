@@ -1,3 +1,5 @@
 requests
 PyMySQL==1.1.1
 cryptography>=42.0.0  # требуется для MySQL (ssl/auth)
+fastapi==0.119.1  # веб-сервер API
+uvicorn==0.38.0  # ASGI сервер запуска FastAPI
