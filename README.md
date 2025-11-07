@@ -1,55 +1,78 @@
-<div align="center">
+# InvestInstruments (минимальный профиль)
 
-# InvestInstruments
-
-Модульный инструментальный набор для:
-
-* Загрузки исторических цен с MOEX ISS
-* Получения консенсус‑прогнозов и индивидуальных таргетов (InstrumentsService/GetForecastBy)
-* Расчёта ценовых потенциалов на основе консенсуса
-* Сервисных операций очистки и повторной загрузки
-
-</div>
-
-## Архитектура модулей
+Упрощённый репозиторий, оставлены только компоненты, необходимые для ежедневного запуска:
 
 ```
-src/invest_core/
-  sdk_client.py      # Контекстные менеджеры sync/async клиента SDK, базовые вызовы
-  instruments.py     # Поиск и сохранение инструментов в perspective_shares
-  forecasts.py       # Получение прогнозов (GetForecastBy) и сохранение по спецификации
-  history.py         # Обёртка над moex_history для массовой загрузки истории
-  moex_history.py    # Низкоуровневый клиент MOEX ISS (пагинация, вставка)
-  potentials.py      # Расчёт ценовых потенциалов (консенсус vs последняя цена)
-  pipeline.py        # Оркестратор полного цикла (консенсус → история → потенциалы → отчёт)
-  maintenance.py     # Очистка аномалий, повторный per‑uid прогноз, пересчёт потенциалов
-  db.py              # Схема и соединения (SQLite / DuckDB)
-  tinkoff_api.py     # DEPRECATED заглушка (исторический REST код удалён)
-  tinkoff_sdk.py     # DEPRECATED заглушка (заменён sdk_client/forecasts)
-  hello.py           # Простой тест запуска
+daily_history_job.py          # Единый job: история → консенсус → потенциалы → retention/top
+src/invest_core/db_mysql.py   # MySQL слой доступа и инициализация схемы
+src/invest_core/normalization.py  # Нормализация чисел и дат
+src/invest_core/forecasts.py  # Загрузка/сохранение консенсусов и таргетов
+src/invest_core/moex_history.py   # Догрузка исторических цен MOEX
+src/invest_core/potentials.py # Расчёт и обслуживание потенциалов
+src/invest_core/__init__.py   # Минимальный ре‑экспорт
+requirements.txt              # Сокращённый список зависимостей (requests, PyMySQL, cryptography)
+README.md                     # Этот файл
 ```
 
-### Основные таблицы
+Удалены все прочие скрипты (миграции, демо, диагностика, legacy SDK, тесты) для снижения объёма и точечной эксплуатации.
+
+### Таблицы (активные)
 
 | Таблица | Назначение | Ключ |
 |---------|------------|------|
-| perspective_shares | Список интересующих инструментов | uid PRIMARY KEY |
-| moex_shares_history | Исторические котировки MOEX | (SECID, TRADEDATE) |
-| consensus_forecasts | История агрегированных консенсусов | (uid, recommendationDate) |
-| consensus_targets | Индивидуальные таргеты аналитиков | id AUTOINCREMENT (ранее (uid, recommendationDate, company)) |
-| instrument_potentials | История расчётов потенциала | (uid, computedAt) |
+| perspective_shares    | Список инструментов (заполняется внешне) | uid PRIMARY KEY |
+| moex_shares_history   | Исторические котировки MOEX              | (SECID, TRADEDATE) |
+| consensus_forecasts   | История консенсусов                      | (uid, recommendationDate) |
+| consensus_targets     | Таргеты аналитиков                       | (uid, recommendationDate, company) |
+| shares_potentials     | История расчёта потенциалов              | (uid, computedAt) |
 
-## Переменные окружения
+## Конфигурация
 
-| Переменная | По умолчанию | Описание |
-|------------|--------------|----------|
-| INVEST_TINKOFF_TOKEN / INVEST_TOKEN | (нет) | Токен доступа к Tinkoff Invest SDK |
-| INVEST_DB_BACKEND | sqlite | Хранилище: sqlite или duckdb |
-| INVEST_DB_FILE | invest_data.db | Имя файла БД |
-| INVEST_MOEX_TIMEOUT_SEC | 10 | Таймаут HTTP MOEX запросов (сек) |
-| INVEST_MOEX_SLEEP_SEC | 0 | Пауза между страницами MOEX (анти rate‑limit) |
-| INVEST_HISTORY_RETENTION_DAYS | 1100 | Срок хранения исторических данных |
-| INVEST_TINKOFF_VERIFY_SSL | 1 | Проверка SSL (legacy, сейчас REST отключён) |
+Теперь основные настройки берутся из файла `config.ini` (создан в корне репозитория). Формат ini с секциями:
+
+```ini
+[database]
+host=localhost
+port=3306
+name=invest
+user=gorbunov
+password=Joj724229
+charset=utf8mb4
+
+[tinkoff]
+api_token=***
+verify_ssl=1
+force_ip=
+no_proxies=0
+
+[job]
+board=TQBR
+retention_days=1100
+TopLimit=10
+collapse_duplicates=1
+skip_history=0
+skip_consensus=0
+skip_potentials=0
+```
+
+Приоритет источников значений:
+1. Переменные окружения (если заданы явно).
+2. `config.ini`.
+3. Жёстко прошитые значения по умолчанию в коде.
+
+### Переменные окружения (fallback / переопределение)
+
+| Переменная | Описание |
+|------------|----------|
+| INVEST_DB_HOST / PORT / NAME / USER / PASSWORD / CHARSET | Переопределяют параметры `[database]` |
+| INVEST_TINKOFF_TOKEN / INVEST_TOKEN | Перебивают `[tinkoff] api_token` |
+| INVEST_TINKOFF_VERIFY_SSL | Перебивает `verify_ssl` |
+| INVEST_MOEX_BOARD | Перебивает `[job] board` |
+| INVEST_HISTORY_RETENTION_DAYS | Перебивает `retention_days` |
+| INVEST_MOEX_TIMEOUT_SEC / INVEST_MOEX_SLEEP_SEC | Тайминги обращения к MOEX API |
+| INVEST_CONFIG_FILE | Альтернативный путь к ini файлу |
+
+Если требуется скрыть пароль/токен из репозитория – замените значения в `config.ini` на плейсхолдеры и используйте секреты окружения.
 
 ## Быстрая установка
 
@@ -59,10 +82,50 @@ python -m venv invest
 pip install -r requirements.txt
 ```
 
-## Первичная инициализация схемы
+### MySQL backend (единственный поддерживаемый)
 
+1. Установите сервер MySQL (Community Server Installer или Docker).
+2. Создайте БД и пользователя:
+  ```sql
+  CREATE DATABASE invest CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+  CREATE USER 'gorbunov'@'localhost' IDENTIFIED BY '*** ваш пароль ***';
+  GRANT ALL PRIVILEGES ON invest.* TO 'gorbunov'@'localhost';
+  FLUSH PRIVILEGES;
+  ```
+3. Либо настройте `config.ini`, либо экспортируйте переменные окружения перед запуском:
+  ```powershell
+  $env:INVEST_DB_BACKEND='mysql'
+  $env:INVEST_DB_HOST='localhost'
+  $env:INVEST_DB_PORT='3306'
+  $env:INVEST_DB_NAME='invest'
+  $env:INVEST_DB_USER='gorbunov'
+  $env:INVEST_DB_PASSWORD='your_password'
+  $env:INVEST_DB_CHARSET='utf8mb4'
+  ```
+4. Схема создаётся автоматически при первом вызове `db_mysql.init_schema()` (например при запуске `daily_history_job.py`).
+
+Особенности реализации:
+* Для MySQL нет `CREATE INDEX IF NOT EXISTS` – индексы создаются после проверки через `INFORMATION_SCHEMA.STATISTICS`.
+* Типы адаптированы: `REAL` → `DOUBLE`, `INTEGER` → `INT/BIGINT`, текстовые поля → `VARCHAR`.
+* Автоинкремент для `consensus_targets.id` реализован через `INT AUTO_INCREMENT PRIMARY KEY`.
+* Аутентификация по умолчанию (caching_sha2_password) требует пакета `cryptography` – он добавлен в `requirements.txt`.
+
+Переключение обратно на SQLite:
 ```powershell
-python db_init.py
+$env:INVEST_DB_BACKEND='sqlite'
+```
+
+Диагностика подключения (см. скрипт `mysql_check.py`):
+```powershell
+python mysql_check.py
+```
+Выводит версию сервера и список таблиц.
+
+## Инициализация
+
+Отдельный скрипт не требуется. Достаточно корректного `config.ini` (или переменных окружения) и запуска:
+```powershell
+python daily_history_job.py --top 5
 ```
 
 ## Поиск и вставка инструмента (пример)
@@ -79,7 +142,7 @@ from invest_core.history import load_history_bulk
 load_history_bulk(board="TQBR")
 ```
 
-## Прогнозы: минимальный API
+## Прогнозы (минимальный API)
 
 ```python
 from invest_core.forecasts import FillingConsensusData
@@ -172,28 +235,20 @@ import os
 print(os.getenv('INVEST_TINKOFF_VERIFY_SSL', '1'))
 ```
 
-## Пересчёт потенциалов
+## Потенциалы
 
+API через `FillingPotentialData` внутри job; отдельный вызов:
 ```python
-from invest_core.potentials import compute_all_potentials
-compute_all_potentials()
+from invest_core.potentials import FillingPotentialData
+stats = FillingPotentialData(skip_null=True)
+print(stats)
 ```
 
-## Полный оркестратор
-
-```python
-from invest_core.pipeline import run_pipeline
-report = run_pipeline(dry_run=False, fetch_forecast_details=True)
-print(report)
-```
+## Ежедневный оркестратор
 
 ## Обслуживание данных
 
-```python
-from invest_core.maintenance import run_maintenance
-maintenance_report = run_maintenance(threshold=1_000_000)
-print(maintenance_report)
-```
+Служебные функции (ретеншн, схлопывание дублей) вызываются внутри `daily_history_job.py`.
 
 ## Аномалии и ограничения
 
@@ -210,25 +265,107 @@ print(maintenance_report)
 
 При сохранении выводятся сообщения о пропуске дублей и вставках. При отсутствии ответа по `uid` статистика `FillingConsensusData` увеличивает счётчик `not_found`.
 
-## SQLite in-memory caveat (тестовая стратегия)
+### MySQL диагностика
 
-Использование `':memory:'` в SQLite создаёт отдельную чистую БД на КАЖДОЕ новое соединение `sqlite3.connect(':memory:')`. В нашем коде слой `db.get_connection()` открывает соединение на каждый вызов, что приводит к исчезновению ранее вставленных данных между операциями в тестах при переключении на in-memory.
+Скрипт `mysql_check.py` (если backend='mysql') показывает:
+* Версию сервера.
+* Список таблиц из `information_schema.tables`.
+* Простейший тест выборки/вставки (не изменяет основные таблицы если уже существуют).
 
-Из-за этого тесты, проверяющие логику дубликатов (например `AddMoexHistory` или сохранение consensus/targets), давали нулевые вставки или постоянные дубликаты.
+Пример запуска:
+```powershell
+$env:INVEST_DB_BACKEND='mysql'
+python mysql_check.py
+```
 
-Решение: переход на временные файловые БД внутри тестов:
+### Тесты уникальности PK
+## Примечания по MySQL
 
-1. Генерируем путь `tests/<test>_temp.db`.
-2. Устанавливаем переменную окружения `INVEST_DB_FILE` перед `reload(db_layer)`.
-3. Инициализируем схему и явно очищаем нужные таблицы.
-4. После теста удаляем файл.
+Проект поддерживает полный переход с SQLite на MySQL:
 
-Преимущества:
-* Поведение идентично реальной эксплуатации (несколько соединений видят одни и те же данные).
-* Исключены скрытые расхождения в логике дубликатов.
-* Упрощается диагностика: файл можно открыть внешним инструментом при необходимости.
+Шаги выполненной миграции:
+1. Добавлен backend `mysql` в `db.py` (PyMySQL, адаптированные типы, индексы через INFORMATION_SCHEMA).
+2. Унификация плейсхолдеров через `exec_sql` (автозамена `?` → `%s` для MySQL).
+3. Скрипт `migrate_sqlite_to_mysql.py` перенёс данные из файла `invest_data.db`:
+   * `perspective_shares`: сохранены все уникальные UID (skipped — существующие).
+   * `moex_shares_history`: ~32k строк перенесено.
+   * `consensus_forecasts` и `shares_potentials`: данные перенесены без потерь.
+   * `consensus_targets`: старые строки пропущены при конфликте автоинкремента (возможен дополнительный импорт без поля id, если потребуется).
+4. Добавлен `mysql_check.py` — быстрый аудит версии и структуры.
+5. Тесты (`pytest`) проходят под backend=mysql (см. раздел "Тесты" выше).
 
-Если нужен чистый изолированный контекст без файла, можно использовать URI `file:memdb1?mode=memory&cache=shared` (shared-cache), но это усложняет настройку. Текущий репозиторий стандартизирован на временных файлах для тестов.
+Оркестратор `daily_history_job.py`:
+* Работает с MySQL после миграции (шаги: история, консенсус, потенциалы).
+* Лог `daily_history_job.log` содержит строки вида `DailyUnified` с агрегированными метриками:
+  - `hist_fetched` / `hist_inserted` / `hist_duplicates`
+  - `cons_cins` (вставлено консенсусов) / `cons_cdup` (дубликаты)
+  - `targets_inserted` / `targets_dups`
+  - `pot_inserted` / `pot_skipped` / `pot_unchanged`
+  - `retention_deleted` (очистка старых потенциалов) / `collapse_deleted` (удалено дублей)
+  - `top_rows` (количество строк в ТОП‑N по относительному потенциалу)
+* Пример успешного полного цикла:
+  ```
+  [2025-11-03T02:29:47.441539+00:00] DailyUnified board=TQBR hist_status=ok hist_fetched=27445 hist_inserted=27445 hist_duplicates=0 cons_processed=50 cons_cins=42 cons_cdup=7 targets_inserted=325 targets_dups=74 pot_processed=50 pot_inserted=42 pot_skipped=1 pot_unchanged=7 retention_deleted=0 collapse_deleted=None top_rows=None duration=91.359s
+  ```
+
+Известные нюансы:
+* MySQL не поддерживает `CREATE INDEX IF NOT EXISTS` — индексы создаются только после проверки наличия.
+* Автоинкремент PK в `consensus_targets` делает прямую переносимую вставку старых id не всегда целесообразной. При необходимости восстановить точные идентификаторы можно создать временную таблицу и выполнить INSERT с явным перечислением столбцов.
+* При чтении дат из MySQL может возвращаться тип `date`; добавлена нормализация в `moex_history.py`.
+* Ошибка `not all arguments converted during string formatting` указывает на использование плейсхолдеров `?` без прохождения через `exec_sql`; обновляйте такие места при расширении функционала.
+
+Рекомендации после переезда:
+1. Настроить регулярный `mysqldump` или использование MySQL Backup для критичных данных.
+2. Добавить мониторинг задержек запросов (Performance Schema) при росте объёма.
+3. Рассмотреть переход вычислительных аналитических выборок на отдельный движок (например ClickHouse) при росте нагрузки.
+
+Команда быстрой проверки:
+```powershell
+$env:INVEST_DB_BACKEND='mysql'
+python mysql_check.py
+python -m pytest -q
+python daily_history_job.py --retention-days 1100 --top 5
+```
+
+Если требуется откат на SQLite:
+```powershell
+$env:INVEST_DB_BACKEND='sqlite'
+python db_init.py
+```
+
+Тесты и вспомогательные проверочные скрипты удалены – используется только runtime проверка через успешный запуск job.
+
+## Удалённые компоненты
+
+Скрипты миграций, диагностики, демо вызовы SDK, тесты и вспомогательные утилиты удалены для минимизации кода. Историческая справка доступна в истории Git.
+
+## legacy_instruments (упрощённый вспомогательный модуль)
+
+Файл `src/invest_core/legacy_instruments.py` содержит минимально сохранённые функции из удалённых модулей:
+
+| Функция | Назначение | Источники удалённых файлов |
+|---------|------------|----------------------------|
+| `PostApiHeaders()` | Сформировать заголовки запроса с Bearer токеном для REST | tinkoff_search.py / rest_instruments.py |
+| `GetUidInstrument(query)` | Найти первый UID акции через REST `FindInstrument` | tinkoff_search.py / rest_instruments.py |
+| `FillingSharesData(uid)` | Обновить строку `perspective_shares` по UID (REST эвристика) | instruments.py |
+
+Особенности:
+* SDK клиент удалён — поиск выполняется только POST запросом к `FindInstrument`.
+* Точная выборка по UID не гарантирована: используется попытка поиска по строке UID и фильтр точного совпадения.
+* Токен берётся из `INVEST_TINKOFF_TOKEN` / `INVEST_TOKEN` либо файлов `tinkoff_token.txt` / `token.txt`; если не найден — fallback на жёстко прописанный (замените его при необходимости).
+* SSL проверка настраивается переменной `INVEST_TINKOFF_VERIFY_SSL` (`0` = отключить).
+* Модуль не импортируется в `daily_history_job.py` и может быть удалён без влияния на ежедневный job.
+
+Пример:
+```python
+from invest_core.legacy_instruments import GetUidInstrument, FillingSharesData
+uid = GetUidInstrument("LKOH")
+print("UID", uid)
+if uid:
+  print(FillingSharesData(uid))
+```
+
+Для полного восстановления функционала работы с инструментами (атрибуты, массовые обновления, точный get по UID) требуется вернуть удалённые SDK модули.
 
 ## Единый ежедневный job (история + консенсус + потенциалы)
 
