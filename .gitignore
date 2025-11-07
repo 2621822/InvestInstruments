@@ -20,3 +20,14 @@ __pycache__/
 # Virtual environments
 .venv/
 tinkoff_token.txt
+# Runtime logs and generated data
+daily_history_job.log
+*_history.csv
+shares_potentials_*.csv
+*.log
+*.xlsx
+project.db
+
+# Removed legacy directories (prevent re-adding)
+webapp/
+tests/

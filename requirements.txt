@@ -1,17 +1,3 @@
 requests
-urllib3
-openpyxl
-aiohttp
-pandas
-pytest
-pytest-asyncio
-numpy
-fastapi[test]
-uvicorn
-jinja2
-duckdb
-grpcio>=1.59.3
-protobuf>=4.25.1
-cachetools>=5.2.0
-python-dateutil>=2.8.2
-tinkoff-investments==0.2.0-beta117
+PyMySQL==1.1.1
+cryptography>=42.0.0  # требуется для MySQL (ssl/auth)

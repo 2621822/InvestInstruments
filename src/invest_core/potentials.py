@@ -1,29 +1,42 @@
-"""potentials.py
+"""potentials.py (MySQL only)
 
-Модуль расчёта потенциалов инструментов на основе:
-  * последней цены закрытия из `moex_shares_history`
-  * последнего консенсуса (`consensus_forecasts.priceConsensus`)
+Модуль расчёта относительных потенциалов акций, сохраняемых в таблицу `shares_potentials`.
 
-Выходные данные записываются в таблицу `instrument_potentials`:
-  (uid, ticker, computedAt, prevClose, consensusPrice, pricePotentialRel)
+Краткая задача: сравнить последний консенсус ("сколько рынок ожидает") с последней ценой закрытия
+и получить относительное отклонение: (consensusPrice - prevClose) / prevClose.
 
-Защита от аномалий:
-  * consensusPrice > 1_000_000 игнорируется
-  * consensusPrice <= 0 игнорируется
-  * prevClose <= 0 игнорируется
+Источники данных:
+    * Последняя цена закрытия (`moex_shares_history.CLOSE` по SECID)
+    * Последний консенсус (`consensus_forecasts.priceConsensus` по UID)
 
-Функции:
-  compute_all_potentials() – полный пересчёт по всем бумагам
-  compute_potentials_for_uids(updated_uids) – частичный пересчёт (напр. после обновлённых прогнозов)
+Отсеивание аномалий и мусора:
+    * Любая цена <= 0 отбрасывается.
+    * Цена > MAX_PRICE (по умолчанию 1_000_000) отбрасывается как явно ошибочная.
+    * Если consensus или close отсутствуют/невалидны – относительный потенциал (pricePotentialRel) не вычисляется.
 
-Все строки прокомментированы.
+Анти-дублирование:
+    * При вставке новой строки мы проверяем последнюю сохранённую запись по UID.
+    * Если относительный потенциал не изменился (с точностью до 1e-9) – вставка пропускается и помечается как "unchanged".
+    * NULL потенциалы (невозможно вычислить) могут накапливаться; последующая процедура CollapseDuplicateSharePotentials их схлопывает.
+
+Сопутствующие задачи обслуживания:
+    * CleanOldSharePotentials: удаляет записи старше заданного порога.
+    * GetTopSharePotentials: выбирает последнюю запись по каждому UID и сортирует по относительному потенциалу.
+    * CollapseDuplicateSharePotentials: чистит исторические дубли (unchanged rel / повторяющиеся NULL подряд).
+
+Архитектурные принципы:
+    * MySQL-only: плейсхолдеры всегда указываем как '?' (преобразуются слоем db_mysql в %s).
+    * Каждая функция открывает собственное соединение через контекст, минимизируя время удержания ресурсов.
+    * Вспомогательные чистые функции (ComputeRelativePotential, FetchLastPotentialRecord, ShouldSkipRel) изолируют бизнес-логику.
+
+Публичные функции см. в __all__ ниже.
 """
 from __future__ import annotations                      # Совместимость аннотаций
 import logging                                          # Логирование
 import datetime as dt                                   # Время для метки computedAt
 from typing import List, Dict, Any                      # Типы аргументов и возвращаемых значений
 
-from . import db as db_layer                            # Слой работы с БД
+from . import db_mysql as db_layer                        # Чистый MySQL слой (exec_sql адаптирует плейсхолдеры)
 
 log = logging.getLogger(__name__)                       # Локальный логгер
 
@@ -31,26 +44,39 @@ MAX_PRICE = 1_000_000                                   # Порог для фи
 
 
 def _valid_price(val: Any) -> float | None:
-    """Проверить и привести цену к float, вернуть None если аномалия."""
-    if val is None:                                     # Пустое значение
+    """Привести значение к float и отфильтровать аномалии.
+
+    Критерии отбрасывания:
+      * None
+      * Не парсится в число
+      * <= 0
+      * > MAX_PRICE
+    Возвращает нормализованное число или None.
+    """
+    if val is None:  # Пустое значение
         return None
-    if isinstance(val, (int, float)):                   # Уже число
+    if isinstance(val, (int, float)):
         num = float(val)
-    else:                                               # Пробуем парсить строку или другой тип
+    else:
         try:
-            num = float(str(val).replace(',', '.'))     # Заменяем запятую на точку
-        except Exception:                               # Парсинг не удался
+            num = float(str(val).replace(',', '.'))
+        except Exception:
             return None
-    if num <= 0:                                        # Нереалистичная или неиспользуемая цена
+    if num <= 0:
         return None
-    if num > MAX_PRICE:                                 # Слишком большая -> игнорируем
+    if num > MAX_PRICE:
         return None
-    return num                                          # Возвращаем допустимое значение
+    return num
 
 
 def _latest_consensus_price(conn, uid: str) -> float | None:
-    """Получить последнюю цену консенсуса из таблицы consensus_forecasts."""
-    cur = conn.execute(
+    """Получить последнюю цену консенсуса (priceConsensus) для заданного UID.
+
+    Возвращает нормализованную цену или None если отсутствует/аномальна.
+    """
+    # exec_sql гарантирует корректные плейсхолдеры под MySQL
+    cur = db_layer.exec_sql(
+        conn,
         "SELECT priceConsensus FROM consensus_forecasts WHERE uid = ? ORDER BY recommendationDate DESC LIMIT 1",
         (uid,)
     )                                                   # Выполняем запрос
@@ -59,8 +85,12 @@ def _latest_consensus_price(conn, uid: str) -> float | None:
 
 
 def _latest_close_price(conn, secid: str) -> float | None:
-    """Получить последнюю цену закрытия из moex_shares_history."""
-    cur = conn.execute(
+    """Получить последнюю цену закрытия (CLOSE) по SECID.
+
+    Возвращает нормализованную цену или None.
+    """
+    cur = db_layer.exec_sql(
+        conn,
         "SELECT CLOSE FROM moex_shares_history WHERE SECID = ? ORDER BY TRADEDATE DESC LIMIT 1",
         (secid,)
     )                                                   # Выполняем запрос
@@ -68,95 +98,9 @@ def _latest_close_price(conn, secid: str) -> float | None:
     return _valid_price(row[0]) if row else None        # Возвращаем отфильтрованную цену
 
 
-def _insert_potential(conn, uid: str, ticker: str, prev_close: float | None, consensus_price: float | None, computed_at: str):
-    """Вставить строку в instrument_potentials."""
-    sql = (
-        "INSERT INTO instrument_potentials(uid, ticker, computedAt, prevClose, consensusPrice, pricePotentialRel) VALUES (?, ?, ?, ?, ?, ?)"
-    )                                                   # SQL вставки
-    rel = None                                          # Относительный потенциал (пока None)
-    if prev_close and consensus_price:                  # Если обе цены валидны
-        rel = (consensus_price - prev_close) / prev_close  # Вычисляем (консенсус - закрытие)/закрытие
-    conn.execute(sql, (uid, ticker, computed_at, prev_close, consensus_price, rel))  # Выполняем вставку
 
 
-def compute_all_potentials() -> Dict[str, Any]:
-    """Полный пересчёт потенциалов по всем uid в perspective_shares."""
-    db_layer.init_schema()                              # Убедиться в наличии схемы
-    now_ts = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")  # ISO UTC
-    processed = 0                                       # Сколько инструментов обработано
-    inserted = 0                                        # Сколько строк вставлено
-    skipped = 0                                         # Сколько пропущено (нет данных)
-    with db_layer.get_connection() as conn:             # Работаем в контексте соединения
-        cur = conn.execute(
-            "SELECT uid, ticker, secid FROM perspective_shares WHERE uid IS NOT NULL"
-        )                                               # Запрос списка бумаг
-        rows = cur.fetchall()                           # Извлекаем все строки
-        for uid, ticker, secid in rows:                 # Итерируем по каждой бумаге
-            processed += 1                              # Инкремент счётчика
-            consensus_price = _latest_consensus_price(conn, uid)  # Последний консенсус
-            prev_close = _latest_close_price(conn, secid)         # Последняя цена закрытия
-            if consensus_price is None or prev_close is None:     # Если чего-то нет
-                skipped += 1                            # Увеличиваем пропуск
-                _insert_potential(conn, uid, ticker, prev_close, consensus_price, now_ts)  # Всё равно фиксируем факт
-                continue                                # Переходим к следующему инструменту
-            _insert_potential(conn, uid, ticker, prev_close, consensus_price, now_ts)  # Вставка валидных данных
-            inserted += 1                               # Считаем успешную вставку
-        if db_layer.BACKEND == "sqlite":               # Коммит для sqlite
-            conn.commit()
-    return {                                            # Возвращаем статистику
-        "processed": processed,
-        "inserted": inserted,
-        "skipped": skipped,
-        "computedAt": now_ts,
-    }
-
-
-def compute_potentials_for_uids(updated_uids: List[str]) -> Dict[str, Any]:
-    """Частичный пересчёт потенциалов только для указанных uid.
-
-    Используется после вставки новых консенсусов, чтобы не пересчитывать всё.
-    """
-    if not updated_uids:                               # Если список пуст
-        return {"processed": 0, "inserted": 0, "skipped": 0, "computedAt": None, "empty": True}
-    db_layer.init_schema()                             # Инициализация схемы
-    now_ts = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")  # ISO UTC
-    processed = 0                                      # Счётчик обработанных
-    inserted = 0                                       # Счётчик вставок
-    skipped = 0                                        # Счётчик пропусков
-    with db_layer.get_connection() as conn:            # Контекст соединения
-        for uid in updated_uids:                       # Итерируем по списку uid
-            processed += 1                             # Инкремент
-            cur_i = conn.execute(
-                "SELECT uid, ticker, secid FROM perspective_shares WHERE uid = ?", (uid,)
-            )                                          # Получаем строку по uid
-            inst_row = cur_i.fetchone()                # Извлекаем результат
-            if not inst_row:                           # Если нет такой бумаги
-                skipped += 1                           # Пропускаем
-                continue                               # Переход к следующему
-            uid2, ticker, secid = inst_row             # Распаковка полей
-            consensus_price = _latest_consensus_price(conn, uid2)  # Последний консенсус
-            prev_close = _latest_close_price(conn, secid)          # Последняя цена закрытия
-            if consensus_price is None or prev_close is None:      # Отсутствуют данные
-                skipped += 1                           # Пропуск
-                _insert_potential(conn, uid2, ticker, prev_close, consensus_price, now_ts)  # Фиксация строки
-                continue                               # Следующий uid
-            _insert_potential(conn, uid2, ticker, prev_close, consensus_price, now_ts)      # Вставка
-            inserted += 1                              # Считаем вставку
-        if db_layer.BACKEND == "sqlite":              # Коммит если sqlite
-            conn.commit()
-    return {                                           # Возвращаем статистику
-        "processed": processed,
-        "inserted": inserted,
-        "skipped": skipped,
-        "computedAt": now_ts,
-        "uids": updated_uids,
-    }
-
-
-__all__ = [                                            # Экспортируем публичные символы
-    "compute_all_potentials",
-    "compute_potentials_for_uids",
-    # Новые функции расчёта потенциала акций (shares_potentials)
+__all__ = [                                            # Публичный API модуля
     "GetLastCloseBySecId",
     "GetLastConsensusByUid",
     "CalculateSharesPotential",
@@ -169,15 +113,18 @@ __all__ = [                                            # Экспортируе�
 # ===================== НОВЫЕ ФУНКЦИИ ПО СПЕЦИФИКАЦИИ =====================
 
 def GetLastCloseBySecId(secid: str) -> Dict[str, Any] | None:
-    """Получить последнюю цену закрытия и дату для SECID из moex_shares_history.
+    """Получить последнюю цену закрытия и дату сделки.
 
-    Возвращает dict: {secid, close, tradedate} или None если нет данных.
+    Формат возвращаемого dict:
+      {"secid": SECID, "close": float|None, "tradedate": DATE}
+    Если записей нет – возвращает None.
     """
     if not secid:
         return None
     db_layer.init_schema()
     with db_layer.get_connection() as conn:
-        cur = conn.execute(
+        cur = db_layer.exec_sql(
+            conn,
             "SELECT CLOSE, TRADEDATE FROM moex_shares_history WHERE SECID = ? ORDER BY TRADEDATE DESC LIMIT 1",
             (secid,)
         )
@@ -190,15 +137,18 @@ def GetLastCloseBySecId(secid: str) -> Dict[str, Any] | None:
 
 
 def GetLastConsensusByUid(uid: str) -> Dict[str, Any] | None:
-    """Получить последний консенсус и дату рекомендации для UID из consensus_forecasts.
+    """Получить последний консенсус по UID.
 
-    Возвращает dict: {uid, priceConsensus, recommendationDate} или None если нет.
+    Формат dict:
+      {"uid": UID, "priceConsensus": float|None, "recommendationDate": DATE}
+    Если записей нет – возвращает None.
     """
     if not uid:
         return None
     db_layer.init_schema()
     with db_layer.get_connection() as conn:
-        cur = conn.execute(
+        cur = db_layer.exec_sql(
+            conn,
             "SELECT priceConsensus, recommendationDate FROM consensus_forecasts WHERE uid = ? ORDER BY recommendationDate DESC LIMIT 1",
             (uid,)
         )
@@ -210,54 +160,75 @@ def GetLastConsensusByUid(uid: str) -> Dict[str, Any] | None:
         return {"uid": uid, "priceConsensus": price, "recommendationDate": recommendation_date}
 
 
-def CalculateSharesPotential(secid: str, uid: str, ticker: str | None = None, *, skip_null: bool = False) -> Dict[str, Any]:
-    """Вычислить потенциал акции и записать в shares_potentials.
+def ComputeRelativePotential(prev_close: float | None, consensus_price: float | None) -> float | None:
+    """Чистая функция вычисления относительного потенциала.
 
-    Формула: pricePotentialRel = (consensusPrice - prevClose) / prevClose
-    Условия расчёта: consensusPrice не None, prevClose не None и > 0.
-    Если условия не выполнены – pricePotentialRel остаётся NULL.
+    Возвращает None если любой из аргументов None или prev_close <= 0.
+    """
+    if prev_close is None or consensus_price is None:
+        return None
+    if prev_close <= 0:
+        return None
+    try:
+        return (consensus_price - prev_close) / prev_close
+    except Exception:
+        return None
+
+
+def FetchLastPotentialRecord(uid: str) -> Dict[str, Any] | None:
+    """Извлечь последнюю сохранённую запись потенциала для UID.
+
+    Возвращает dict или None.
     """
     db_layer.init_schema()
-    # Используем миллисекундную точность для снижения коллизий PK
+    with db_layer.get_connection() as conn:
+        cur = db_layer.exec_sql(
+            conn,
+            "SELECT computedAt, prevClose, consensusPrice, pricePotentialRel FROM shares_potentials WHERE uid = ? ORDER BY computedAt DESC LIMIT 1",
+            (uid,)
+        )
+        r = cur.fetchone()
+    if not r:
+        return None
+    return {
+        "computedAt": r[0],
+        "prevClose": r[1],
+        "consensusPrice": r[2],
+        "pricePotentialRel": r[3],
+    }
+
+
+def ShouldSkipRel(last_rel: float | None, new_rel: float | None, *, epsilon: float = 1e-9) -> bool:
+    """Определить, считать ли потенциал неизменившимся (дубликат).
+
+    Правила:
+      * Если оба значения не None и |diff| < epsilon -> True (пропуск).
+      * Иначе False. NULL не обновляет эталон.
+    """
+    if last_rel is not None and new_rel is not None:
+        return abs(last_rel - new_rel) < epsilon
+    return False
+
+
+def CalculateSharesPotential(secid: str, uid: str, ticker: str | None = None, *, skip_null: bool = False) -> Dict[str, Any]:
+    """Рассчитать и (при необходимости) сохранить потенциал в `shares_potentials`.
+
+    Возвращает структуру с полями uid, secid, ticker, computedAt, prevClose, consensusPrice, pricePotentialRel
+    и флагами skipped / unchanged (если применимо).
+    """
+    db_layer.init_schema()
+    # Используем миллисекундную (микросекундную при коллизии) точность для снижения вероятности конфликтов PK
     now_dt = dt.datetime.now(dt.UTC)
     now_ts = now_dt.isoformat(timespec="milliseconds")
     last_close = GetLastCloseBySecId(secid)
     last_cons = GetLastConsensusByUid(uid)
     prev_close = (last_close or {}).get("close")
     consensus_price = (last_cons or {}).get("priceConsensus")
-    rel = None
-    if prev_close and consensus_price:
-        try:
-            rel = (consensus_price - prev_close) / prev_close
-        except Exception:
-            rel = None
-    # Проверка последней сохранённой записи для uid, чтобы не копить дубли при неизменном rel
-    last_row: Dict[str, Any] | None = None
-    last_rel: float | None = None
-    with db_layer.get_connection() as _c:
-        cur = _c.execute(
-            "SELECT computedAt, prevClose, consensusPrice, pricePotentialRel FROM shares_potentials WHERE uid = ? ORDER BY computedAt DESC LIMIT 1",
-            (uid,)
-        )
-        r = cur.fetchone()
-        if r:
-            last_row = {
-                "computedAt": r[0],
-                "prevClose": r[1],
-                "consensusPrice": r[2],
-                "pricePotentialRel": r[3],
-            }
-            last_rel = r[3]
-    unchanged = False
-    # Если последний относительный потенциал совпадает с новым (учитываем небольшую плавающую погрешность)
-    if last_rel is not None and rel is not None:
-        # Допускаем расхождение до 1e-9 (float арифметика)
-        if abs(last_rel - rel) < 1e-9:
-            unchanged = True
-    # Если оба None (rel не рассчитывается) считаем что дубли не критичны, но можем пропустить при skip_null
-    if last_rel is None and rel is None:
-        # Не считаем как unchanged для метрики inserted/ skipped, но дадим возможность skip_null пропустить
-        pass
+    rel = ComputeRelativePotential(prev_close, consensus_price)
+    # Получаем предыдущую запись для сравнения
+    last_row = FetchLastPotentialRecord(uid)
+    last_rel = (last_row or {}).get("pricePotentialRel")
+    unchanged = ShouldSkipRel(last_rel, rel)
     if unchanged:
         return {
             "uid": uid,
@@ -271,7 +242,7 @@ def CalculateSharesPotential(secid: str, uid: str, ticker: str | None = None, *,
             "unchanged": True,
         }
     if skip_null and (rel is None):
-        # Пропуск вставки, возвращаем только вычисленные значения
+        # Пропускаем вставку NULL потенциала (конфигурационно), возвращаем вычисленные значения
         return {
             "uid": uid,
             "secid": secid,
@@ -282,21 +253,21 @@ def CalculateSharesPotential(secid: str, uid: str, ticker: str | None = None, *,
             "pricePotentialRel": rel,
             "skipped": True,
         }
-    with db_layer.get_connection() as conn:
+    with db_layer.get_connection() as conn:  # Сохраняем запись
         try:
-            conn.execute(
+            db_layer.exec_sql(
+                conn,
                 "INSERT INTO shares_potentials(uid, secid, ticker, computedAt, prevClose, consensusPrice, pricePotentialRel) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (uid, secid, ticker, now_ts, prev_close, consensus_price, rel)
             )
         except Exception:
             alt_ts = now_dt.isoformat(timespec="microseconds")
-            conn.execute(
+            db_layer.exec_sql(
+                conn,
                 "INSERT INTO shares_potentials(uid, secid, ticker, computedAt, prevClose, consensusPrice, pricePotentialRel) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (uid, secid, ticker, alt_ts, prev_close, consensus_price, rel)
             )
             now_ts = alt_ts
-        if db_layer.BACKEND == "sqlite":
-            conn.commit()
     return {
         "uid": uid,
         "secid": secid,
@@ -309,15 +280,24 @@ def CalculateSharesPotential(secid: str, uid: str, ticker: str | None = None, *,
 
 
 def FillingPotentialData(*, skip_null: bool = False) -> Dict[str, Any]:
-    """Ежедневный обход перспективных акций и расчёт их потенциала в shares_potentials."""
+    """Массовый пересчёт потенциалов для всех бумаг в `perspective_shares`.
+
+    Счётчики:
+      processed  – количество обработанных бумаг
+      inserted   – вставки новых строк (включая вставку с NULL rel если skip_null=False)
+      skipped    – пропуски (NULL rel при skip_null=True или пометка skipped)
+      unchanged  – относительный потенциал не изменился (дубль)
+    """
     db_layer.init_schema()
     processed = 0
-    inserted = 0      # сколько вставок (новых или изменившихся rel)
-    skipped = 0       # rel = NULL (и пропущено по skip_null)
-    unchanged = 0     # сколько пропущено из-за отсутствия изменения rel
-    rows: list[Dict[str, Any]] = []
+    inserted = 0
+    skipped = 0
+    unchanged = 0
+    rows: List[Dict[str, Any]] = []
     with db_layer.get_connection() as conn:
-        cur = conn.execute("SELECT uid, secid, ticker FROM perspective_shares WHERE uid IS NOT NULL AND secid IS NOT NULL")
+        cur = conn.execute(
+            "SELECT uid, secid, ticker FROM perspective_shares WHERE uid IS NOT NULL AND secid IS NOT NULL"
+        )
         insts = cur.fetchall()
     for uid, secid, ticker in insts:
         processed += 1
@@ -325,19 +305,17 @@ def FillingPotentialData(*, skip_null: bool = False) -> Dict[str, Any]:
         rows.append(res)
         if res.get("unchanged"):
             unchanged += 1
-        else:
-            if res.get("pricePotentialRel") is None:
-                # Если rel = None и была реально вставка (skip_null=False), считаем в skipped
-                skipped += 1 if res.get("skipped") or skip_null else 0
-                if not res.get("skipped") and not skip_null:
-                    # Вставлена запись с NULL rel
-                    inserted += 1
+            continue
+        if res.get("pricePotentialRel") is None:
+            if res.get("skipped") or skip_null:
+                skipped += 1
             else:
-                if res.get("skipped"):
-                    # Это случай skip_null=True для валидного rel? Теоретически не должно происходить
-                    skipped += 1
-                else:
-                    inserted += 1
+                inserted += 1  # вставка с NULL rel
+        else:
+            if res.get("skipped"):
+                skipped += 1
+            else:
+                inserted += 1
     return {
         "processed": processed,
         "inserted": inserted,
@@ -350,10 +328,9 @@ def FillingPotentialData(*, skip_null: bool = False) -> Dict[str, Any]:
 # ===================== РЕТЕНШН И ТОП-10 =====================
 
 def CleanOldSharePotentials(max_age_days: int = 90) -> Dict[str, Any]:
-    """Удалить устаревшие записи из shares_potentials старше max_age_days.
+    """Удалить записи старше заданного возраста.
 
-    Критерий: computedAt < (now_utc - max_age_days).
-    Формат computedAt: ISO (секунды/миллисекунды/микросекунды) – сравнение лексикографически корректно для ISO.
+    Порог = now_utc - max_age_days. Сравнение как строк ISO допустимо (лексикографический порядок сохранён).
     """
     if max_age_days <= 0:
         return {"deleted": 0, "max_age_days": max_age_days, "skipped": True}
@@ -363,29 +340,23 @@ def CleanOldSharePotentials(max_age_days: int = 90) -> Dict[str, Any]:
     deleted = 0
     with db_layer.get_connection() as conn:
         # Подсчёт кандидатов
-        cur = conn.execute(
-            "SELECT COUNT(*) FROM shares_potentials WHERE computedAt < ?", (threshold_iso,)
+        cur = db_layer.exec_sql(
+            conn,
+            "SELECT COUNT(*) FROM shares_potentials WHERE computedAt < ?",
+            (threshold_iso,)
         )
         deleted = cur.fetchone()[0]
         if deleted:
-            conn.execute(
-                "DELETE FROM shares_potentials WHERE computedAt < ?", (threshold_iso,)
+            db_layer.exec_sql(
+                conn,
+                "DELETE FROM shares_potentials WHERE computedAt < ?",
+                (threshold_iso,)
             )
-        if db_layer.BACKEND == "sqlite":
-            conn.commit()
     return {"deleted": deleted, "threshold": threshold_iso, "max_age_days": max_age_days}
 
 
-def GetTopSharePotentials(limit: int = 10, *, max_age_days: int | None = None,
-                          min_prev_close: float | None = None) -> Dict[str, Any]:
-    """Получить топ-N бумаг по относительному потенциалу из shares_potentials.
-
-    Логика:
-      1. Берём последнюю запись по каждому uid (MAX computedAt).
-      2. Фильтруем pricePotentialRel IS NOT NULL.
-      3. Доп. фильтры: возраст записи (max_age_days), минимальный prevClose.
-      4. Сортируем по pricePotentialRel DESC.
-    """
+def GetTopSharePotentials(limit: int = 10, *, max_age_days: int | None = None, min_prev_close: float | None = None) -> Dict[str, Any]:
+    """Получить топ-N относительных потенциалов (последняя запись на UID)."""
     if limit <= 0:
         return {"status": "ok", "rows": 0, "data": []}
     db_layer.init_schema()
@@ -411,7 +382,7 @@ def GetTopSharePotentials(limit: int = 10, *, max_age_days: int | None = None,
     params.append(limit)
     rows: list[tuple] = []
     with db_layer.get_connection() as conn:
-        cur = conn.execute(sql, params)
+        cur = db_layer.exec_sql(conn, sql, tuple(params))
         rows = cur.fetchall()
     data = [
         {
@@ -430,58 +401,55 @@ def GetTopSharePotentials(limit: int = 10, *, max_age_days: int | None = None,
 
 
 def CollapseDuplicateSharePotentials(*, rel_epsilon: float = 1e-9) -> Dict[str, Any]:
-    """Удалить исторические дубли потенциалов для каждого uid, оставив только записи
-    при изменении `pricePotentialRel` больше заданного порога.
+    """Удалить исторические дубли потенциальных записей.
 
-    Логика:
-      1. Берём все записи по uid упорядоченные по computedAt ASC.
-      2. Считаем предыдущую "валидную" величину rel (NULL не обновляет эталон).
-      3. Если новая запись имеет rel и |rel - prev_rel| < rel_epsilon, помечаем её на удаление.
-      4. NULL rel сохраняем только первую подряд серию (прочие подряд NULL можно удалить для экономии).
-
-    Возвращает статистику: deleted, scanned_uids, scanned_rows.
+    Стратегия:
+      * Сканируем все записи для каждого UID (ASC по времени)
+      * Удаляем записи, где rel не изменился больше порога rel_epsilon от предыдущего ненулевого.
+      * Оставляем только первую NULL; последующие подряд NULL удаляем.
+      * Удаление по (uid, computedAt).
+    Возвращает статистику.
     """
     db_layer.init_schema()
     deleted = 0
     scanned_rows = 0
     scanned_uids = 0
     with db_layer.get_connection() as conn:
-        # Получаем список uid имеющих более одной записи
         cur = conn.execute("SELECT uid FROM shares_potentials GROUP BY uid HAVING COUNT(*) > 1")
         uid_rows = [r[0] for r in cur.fetchall()]
         for uid in uid_rows:
             scanned_uids += 1
-            c2 = conn.execute(
-                "SELECT computedAt, pricePotentialRel, rowid FROM shares_potentials WHERE uid = ? ORDER BY computedAt ASC",
+            c2 = db_layer.exec_sql(
+                conn,
+                "SELECT computedAt, pricePotentialRel FROM shares_potentials WHERE uid = ? ORDER BY computedAt ASC",
                 (uid,)
             )
             rows = c2.fetchall()
             scanned_rows += len(rows)
             prev_rel: float | None = None
             first_null_kept = False
-            to_delete_rowids: list[int] = []
-            for computedAt, rel, rowid in rows:
+            to_delete_keys: list[str] = []
+            for computedAt, rel in rows:
                 if rel is None:
-                    # Сохраняем первый NULL, последующие подряд удаляем
                     if first_null_kept:
-                        to_delete_rowids.append(rowid)
+                        to_delete_keys.append(computedAt)
                     else:
                         first_null_kept = True
                     continue
                 if prev_rel is None:
                     prev_rel = rel
                     continue
-                # Сравнение с предыдущим валидным rel
                 if abs(rel - prev_rel) < rel_epsilon:
-                    to_delete_rowids.append(rowid)
+                    to_delete_keys.append(computedAt)
                 else:
                     prev_rel = rel
-            if to_delete_rowids:
-                # Удаляем батчем
-                conn.executemany("DELETE FROM shares_potentials WHERE rowid = ?", [(rid,) for rid in to_delete_rowids])
-                deleted += len(to_delete_rowids)
-        if db_layer.BACKEND == "sqlite":
-            conn.commit()
+            for ck in to_delete_keys:
+                db_layer.exec_sql(
+                    conn,
+                    "DELETE FROM shares_potentials WHERE uid = ? AND computedAt = ?",
+                    (uid, ck)
+                )
+            deleted += len(to_delete_keys)
     return {
         "deleted": deleted,
         "scanned_uids": scanned_uids,

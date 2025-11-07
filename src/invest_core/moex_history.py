@@ -27,7 +27,7 @@ import logging
 import os
 import requests
 
-from . import db as db_layer
+from . import db_mysql as db_layer  # Используем чистый MySQL слой
 
 log = logging.getLogger(__name__)
 
@@ -51,15 +51,24 @@ def _date_n_days_ago(days: int) -> str:
 
 
 def _next_day(date_str: str) -> str:
-    d = dt.date.fromisoformat(date_str)
+    # Поддержка случая когда date_str уже объект date (MySQL драйвер возвращает date)
+    if isinstance(date_str, dt.date):
+        d = date_str
+    else:
+        d = dt.date.fromisoformat(str(date_str))
     return (d + dt.timedelta(days=1)).isoformat()
 
 
 def _get_last_tradedate(secid: str) -> str | None:
     with db_layer.get_connection() as conn:
-        cur = conn.execute("SELECT TRADEDATE FROM moex_shares_history WHERE SECID=? ORDER BY TRADEDATE DESC LIMIT 1", (secid,))
+        cur = db_layer.exec_sql(conn, "SELECT TRADEDATE FROM moex_shares_history WHERE SECID=? ORDER BY TRADEDATE DESC LIMIT 1", (secid,))
         row = cur.fetchone()
-        return row[0] if row else None
+        if not row:
+            return None
+        val = row[0]
+        if isinstance(val, (dt.date, dt.datetime)):
+            return val.date().isoformat() if isinstance(val, dt.datetime) else val.isoformat()
+        return str(val)
 
 
 def _fetch_pages(board: str, secid: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
@@ -138,45 +147,29 @@ def AddMoexHistory(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     inserted = 0
     duplicates = 0
     with db_layer.get_connection() as conn:
-        backend = db_layer.BACKEND
         try:
-            if backend == 'sqlite':
-                conn.execute("""
+            # Чистая MySQL таблица с составным PK (SECID, TRADEDATE)
+            db_layer.exec_sql(
+                conn,
+                """
                 CREATE TABLE IF NOT EXISTS moex_shares_history (
-                    SECID TEXT NOT NULL,
-                    TRADEDATE TEXT NOT NULL,
-                    BOARDID TEXT,
-                    OPEN REAL,
-                    CLOSE REAL,
-                    HIGH REAL,
-                    LOW REAL,
-                    WAPRICE REAL,
-                    SHORTNAME TEXT,
-                    NUMTRADES INTEGER,
-                    VOLUME INTEGER,
-                    VALUE REAL,
-                    WAVAL INTEGER,
-                    PRIMARY KEY (SECID, TRADEDATE)
-                )
-                """)
-            else:
-                conn.execute("""
-                CREATE TABLE IF NOT EXISTS moex_shares_history (
-                    SECID TEXT,
-                    TRADEDATE TEXT,
-                    BOARDID TEXT,
+                    SECID VARCHAR(32) NOT NULL,
+                    TRADEDATE DATE NOT NULL,
+                    BOARDID VARCHAR(16),
                     OPEN DOUBLE,
                     CLOSE DOUBLE,
                     HIGH DOUBLE,
                     LOW DOUBLE,
                     WAPRICE DOUBLE,
-                    SHORTNAME TEXT,
-                    NUMTRADES INTEGER,
-                    VOLUME INTEGER,
+                    SHORTNAME VARCHAR(64),
+                    NUMTRADES INT,
+                    VOLUME BIGINT,
                     VALUE DOUBLE,
-                    WAVAL INTEGER
-                )
-                """)
+                    WAVAL BIGINT,
+                    PRIMARY KEY (SECID, TRADEDATE)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
         except Exception as ex:  # noqa
             log.warning("Failed to ensure moex_shares_history exists ex=%s", ex)
         for r in rows:
@@ -184,12 +177,13 @@ def AddMoexHistory(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             tradedate = r.get("TRADEDATE")
             if not secid or not tradedate:
                 continue
-            cur = conn.execute("SELECT 1 FROM moex_shares_history WHERE SECID=? AND TRADEDATE=? LIMIT 1", (secid, tradedate))
+            cur = db_layer.exec_sql(conn, "SELECT 1 FROM moex_shares_history WHERE SECID=? AND TRADEDATE=? LIMIT 1", (secid, tradedate))
             if cur.fetchone():
                 duplicates += 1
                 continue
             try:
-                conn.execute(
+                db_layer.exec_sql(
+                    conn,
                     "INSERT INTO moex_shares_history(SECID, TRADEDATE, BOARDID, OPEN, CLOSE, HIGH, LOW, WAPRICE, SHORTNAME, NUMTRADES, VOLUME, VALUE, WAVAL) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         secid,
@@ -210,8 +204,6 @@ def AddMoexHistory(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 inserted += 1
             except Exception as ex:  # noqa
                 log.warning("Insert failed SECID=%s TRADEDATE=%s ex=%s", secid, tradedate, ex)
-        if backend == 'sqlite':
-            conn.commit()
     return {"inserted": inserted, "duplicates": duplicates}
 
 

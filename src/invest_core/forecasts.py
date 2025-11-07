@@ -10,21 +10,81 @@
   Consensus: сравнение всех семи полей (uid,ticker,recommendation,currency,consensus,minTarget,maxTarget) с последней записью по uid.
   Targets: поиск записи по (uid,recommendationDate,company) и затем сравнение полного набора полей.
 """
-from __future__ import annotations
-from typing import Any, Dict, List
-import json
-import http.client
-import ssl
-import logging
-from datetime import datetime, UTC
+from __future__ import annotations  # Отложенные аннотации (Python <3.11)
+from typing import Any, Dict, List, Optional
+import json                                   # Парсинг JSON ответов API
+import http.client                            # Низкоуровневый HTTPS клиент
+import ssl                                    # SSL контекст (возможен кастомный сертификат)
+import logging                                # Логирование предупреждений и статуса
+from datetime import datetime, UTC            # Работа с датами (TZ aware)
+import os                                     # Переменные окружения / пути
+from dataclasses import dataclass             # Структурирование записей
 
-from . import db as db_layer
-import os
+from . import db_mysql as db_layer            # Чистый MySQL слой доступа к БД
+from .normalization import to_number, normalize_date  # Универсальные утилиты приведения
 
 log = logging.getLogger(__name__)
 
-# Глобальный кэш на время работы процесса (в рамках одного запуска)
-_RUN_CACHE: Dict[str, Any] = {}
+_RUN_CACHE: Dict[str, Any] = {}              # In-memory кэш ответов API на время запуска
+
+# ------------------------- Dataclasses -------------------------
+@dataclass(slots=True)
+class ConsensusRecord:
+    """Нормализованная запись консенсуса для вставки.
+
+    Все числовые поля переводятся в float или None.
+    recommendationDate обрезается до YYYY-MM-DD.
+    """
+    uid: str
+    ticker: Optional[str]
+    recommendation: Optional[str]
+    recommendationDate: str
+    currency: Optional[str]
+    consensus: float | None
+    minTarget: float | None
+    maxTarget: float | None
+
+    @classmethod
+    def from_raw(cls, uid: str, ticker: str | None, recommendation: str | None,
+                 recommendationDate: str, currency: str | None,
+                 consensus: Any, minTarget: Any, maxTarget: Any) -> 'ConsensusRecord':
+        return cls(
+            uid=uid,
+            ticker=ticker,
+            recommendation=recommendation,
+            recommendationDate=normalize_date(recommendationDate),
+            currency=currency,
+            consensus=to_number(consensus),
+            minTarget=to_number(minTarget),
+            maxTarget=to_number(maxTarget),
+        )
+
+@dataclass(slots=True)
+class TargetRecord:
+    """Нормализованная запись таргета аналитика."""
+    uid: str
+    ticker: Optional[str]
+    company: Optional[str]
+    recommendation: Optional[str]
+    recommendationDate: str
+    currency: Optional[str]
+    targetPrice: float | None
+    showName: Optional[str]
+
+    @classmethod
+    def from_raw(cls, uid: str, ticker: str | None, company: str | None,
+                 recommendation: str | None, recommendationDate: str,
+                 currency: str | None, targetPrice: Any, showName: str | None) -> 'TargetRecord':
+        return cls(
+            uid=uid,
+            ticker=ticker,
+            company=company,
+            recommendation=recommendation,
+            recommendationDate=normalize_date(recommendationDate),
+            currency=currency,
+            targetPrice=to_number(targetPrice),
+            showName=showName,
+        )
 
 # ----------------------------------------------------------------------------
 # НИЗКОУРОВНЕВЫЙ ВЫЗОВ API (если SDK недоступен используем прямой POST)
@@ -143,8 +203,8 @@ def ResetForecastCache() -> None:
 # ----------------------------------------------------------------------------
 
 def AddConsensusForecasts(uid: str, ticker: str | None, recommendation: str | None, recommendationDate: str,
-                          currency: str | None, consensus: float | None, minTarget: float | None,
-                          maxTarget: float | None) -> Dict[str, Any]:
+                          currency: str | None, consensus: Any, minTarget: Any,
+                          maxTarget: Any) -> Dict[str, Any]:
     """Сохранить консенсус прогноз.
 
     Алгоритм:
@@ -153,74 +213,58 @@ def AddConsensusForecasts(uid: str, ticker: str | None, recommendation: str | No
       3. Если полностью совпадает – пропустить.
       4. Иначе вставить новую запись с текущей recommendationDate.
     """
-    db_layer.init_schema()
-    # Приведение числовых полей (поддержка dict/объектов MoneyValue с units/nano)
-    def _to_number(val: Any) -> float | None:
-        if val is None:
-            return None
-        if isinstance(val, (int, float)):
-            return float(val)
-        if isinstance(val, dict) and 'units' in val and 'nano' in val:
-            try:
-                return int(val.get('units') or 0) + int(val.get('nano') or 0) / 1_000_000_000
-            except Exception:
-                return None
-        if hasattr(val, 'units') and hasattr(val, 'nano'):
-            try:
-                return int(getattr(val, 'units') or 0) + int(getattr(val, 'nano') or 0) / 1_000_000_000
-            except Exception:
-                return None
-        return None
-    consensus = _to_number(consensus)
-    minTarget = _to_number(minTarget)
-    maxTarget = _to_number(maxTarget)
+    db_layer.init_schema()  # Инициализация схемы
+    rec_obj = ConsensusRecord.from_raw(uid, ticker, recommendation, recommendationDate,
+                                       currency, consensus, minTarget, maxTarget)
     with db_layer.get_connection() as conn:
-        cur = conn.execute(
+        # Получаем последнюю запись по uid для сравнения (ORDER BY recommendationDate DESC)
+        cur = db_layer.exec_sql(
+            conn,
             "SELECT uid, ticker, recommendation, currency, priceConsensus, minTarget, maxTarget FROM consensus_forecasts WHERE uid=? ORDER BY recommendationDate DESC LIMIT 1",
             (uid,)
         )
         row = cur.fetchone()
         if row and all([
-            row[0] == uid,
-            row[1] == ticker,
-            row[2] == recommendation,
-            row[3] == currency,
-            row[4] == consensus,
-            row[5] == minTarget,
-            row[6] == maxTarget,
+            row[0] == rec_obj.uid,
+            row[1] == rec_obj.ticker,
+            row[2] == rec_obj.recommendation,
+            row[3] == rec_obj.currency,
+            row[4] == rec_obj.consensus,
+            row[5] == rec_obj.minTarget,
+            row[6] == rec_obj.maxTarget,
         ]):
             print(f"Прогноз по бумаге {ticker} уже сохранен ранее.")
             return {"status": "dup", "uid": uid}
         try:
-            conn.execute(
+            db_layer.exec_sql(  # Пытаемся вставить новую строку
+                conn,
                 "INSERT INTO consensus_forecasts(uid, ticker, recommendation, recommendationDate, currency, priceConsensus, minTarget, maxTarget) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (uid, ticker, recommendation, recommendationDate, currency, consensus, minTarget, maxTarget)
+                (rec_obj.uid, rec_obj.ticker, rec_obj.recommendation, rec_obj.recommendationDate, rec_obj.currency, rec_obj.consensus, rec_obj.minTarget, rec_obj.maxTarget)
             )
         except Exception as ex:  # noqa
-            if 'UNIQUE' in str(ex).upper():
+            ex_up = str(ex).upper()
+            if 'UNIQUE' in ex_up or 'DUPLICATE ENTRY' in ex_up:
                 # Проверим существующую запись на эту дату
-                cur2 = conn.execute("SELECT ticker, recommendation, currency, priceConsensus, minTarget, maxTarget FROM consensus_forecasts WHERE uid=? AND recommendationDate=?", (uid, recommendationDate))
+                cur2 = db_layer.exec_sql(conn, "SELECT ticker, recommendation, currency, priceConsensus, minTarget, maxTarget FROM consensus_forecasts WHERE uid=? AND recommendationDate=?", (uid, recommendationDate))
                 row2 = cur2.fetchone()
                 if row2 and all([
-                    row2[0] == ticker,
-                    row2[1] == recommendation,
-                    row2[2] == currency,
-                    row2[3] == consensus,
-                    row2[4] == minTarget,
-                    row2[5] == maxTarget,
+                    row2[0] == rec_obj.ticker,
+                    row2[1] == rec_obj.recommendation,
+                    row2[2] == rec_obj.currency,
+                    row2[3] == rec_obj.consensus,
+                    row2[4] == rec_obj.minTarget,
+                    row2[5] == rec_obj.maxTarget,
                 ]):
                     print(f"Прогноз по бумаге {ticker} уже сохранен ранее (same date).")
                     return {"status": "dup", "uid": uid}
                 else:
                     # Обновим запись этой даты новыми значениями
-                    conn.execute("UPDATE consensus_forecasts SET ticker=?, recommendation=?, currency=?, priceConsensus=?, minTarget=?, maxTarget=? WHERE uid=? AND recommendationDate=?",
-                                 (ticker, recommendation, currency, consensus, minTarget, maxTarget, uid, recommendationDate))
+                    db_layer.exec_sql(conn, "UPDATE consensus_forecasts SET ticker=?, recommendation=?, currency=?, priceConsensus=?, minTarget=?, maxTarget=? WHERE uid=? AND recommendationDate=?",  # Обновляем существующую запись этой даты
+                                      (rec_obj.ticker, rec_obj.recommendation, rec_obj.currency, rec_obj.consensus, rec_obj.minTarget, rec_obj.maxTarget, rec_obj.uid, rec_obj.recommendationDate))
             else:
                 raise
-        if db_layer.BACKEND == 'sqlite':
-            conn.commit()
-    print(f"Консенсус по {ticker} сохранен (uid={uid}).")
-    return {"status": "inserted", "uid": uid, "recommendationDate": recommendationDate}
+    print(f"Консенсус по {rec_obj.ticker} сохранен (uid={rec_obj.uid}).")
+    return {"status": "inserted", "uid": rec_obj.uid, "recommendationDate": rec_obj.recommendationDate}
 
 
 # ----------------------------------------------------------------------------
@@ -228,59 +272,55 @@ def AddConsensusForecasts(uid: str, ticker: str | None, recommendation: str | No
 # ----------------------------------------------------------------------------
 
 def AddConsensusTargets(uid: str, ticker: str | None, company: str | None, recommendation: str | None,
-                        recommendationDate: str, currency: str | None, targetPrice: float | None,
+                        recommendationDate: str, currency: str | None, targetPrice: Any,
                         showName: str | None) -> Dict[str, Any]:
-    """Сохранить один таргет аналитика с проверкой дублей.
+    """Сохранить/обновить таргет аналитика без дублей.
 
-    Дубликат определяется так:
-      1. Ищем запись по (uid,recommendationDate,company).
-      2. Если найдена – сравниваем все поля. Если совпадают – пропускаем.
-      3. Иначе вставляем новую запись.
+    Логика:
+      1. Нормализуем дату (обрезаем до YYYY-MM-DD).
+      2. Приводим targetPrice к float.
+      3. Пытаемся найти запись по составному ключу (uid, recommendationDate, company).
+         a) Если запись найдена и все поля совпадают -> статус dup.
+         b) Если запись найдена и часть полей отличается -> выполняем UPDATE и статус updated.
+         c) Если запись не найдена -> INSERT и статус inserted.
     """
-    db_layer.init_schema()
-    def _to_number(val: Any) -> float | None:
-        if val is None:
-            return None
-        if isinstance(val, (int, float)):
-            return float(val)
-        if isinstance(val, dict) and 'units' in val and 'nano' in val:
-            try:
-                return int(val.get('units') or 0) + int(val.get('nano') or 0) / 1_000_000_000
-            except Exception:
-                return None
-        if hasattr(val, 'units') and hasattr(val, 'nano'):
-            try:
-                return int(getattr(val, 'units') or 0) + int(getattr(val, 'nano') or 0) / 1_000_000_000
-            except Exception:
-                return None
-        return None
-    targetPrice = _to_number(targetPrice)
+    db_layer.init_schema()  # Инициализация схемы
+    rec_obj = TargetRecord.from_raw(uid, ticker, company, recommendation,
+                                    recommendationDate, currency, targetPrice, showName)
     with db_layer.get_connection() as conn:
-        cur = conn.execute(
-            "SELECT uid, ticker, company, recommendation, recommendationDate, currency, targetPrice, showName FROM consensus_targets WHERE uid=? AND recommendationDate=? AND company=? LIMIT 1",
-            (uid, recommendationDate, company)
+        cur = db_layer.exec_sql(
+            conn,
+            "SELECT uid, ticker, company, recommendation, recommendationDate, currency, targetPrice, showName FROM consensus_targets WHERE uid=? AND recommendationDate=? AND company=?",
+            (rec_obj.uid, rec_obj.recommendationDate, rec_obj.company)
         )
         row = cur.fetchone()
-        if row and all([
-            row[0] == uid,
-            row[1] == ticker,
-            row[2] == company,
-            row[3] == recommendation,
-            row[4] == recommendationDate,
-            row[5] == currency,
-            (row[6] == targetPrice or (row[6] is None and targetPrice is None)),
-            row[7] == showName,
-        ]):
-            print(f"Прогноз {company} по {ticker} за {recommendationDate} уже сохранен ранее.")
-            return {"status": "dup", "uid": uid, "recommendationDate": recommendationDate, "company": company}
-        conn.execute(
+        if row:
+            same = (
+                row[1] == rec_obj.ticker and
+                row[3] == rec_obj.recommendation and
+                row[5] == rec_obj.currency and
+                (row[6] == rec_obj.targetPrice or (row[6] is None and rec_obj.targetPrice is None)) and
+                row[7] == rec_obj.showName
+            )
+            if same:
+                print(f"Прогноз {rec_obj.company} по {rec_obj.ticker} за {rec_obj.recommendationDate} уже сохранен ранее.")
+                return {"status": "dup", "uid": rec_obj.uid, "recommendationDate": rec_obj.recommendationDate, "company": rec_obj.company}
+            # Обновляем запись (данные изменились)
+            db_layer.exec_sql(  # Выполняем UPDATE изменившихся полей
+                conn,
+                "UPDATE consensus_targets SET ticker=?, recommendation=?, currency=?, targetPrice=?, showName=? WHERE uid=? AND recommendationDate=? AND company=?",
+                (rec_obj.ticker, rec_obj.recommendation, rec_obj.currency, rec_obj.targetPrice, rec_obj.showName, rec_obj.uid, rec_obj.recommendationDate, rec_obj.company)
+            )
+            print(f"Прогноз {rec_obj.company} по {rec_obj.ticker} за {rec_obj.recommendationDate} обновлен.")
+            return {"status": "updated", "uid": rec_obj.uid, "recommendationDate": rec_obj.recommendationDate, "company": rec_obj.company}
+        # Вставка новой записи
+        db_layer.exec_sql(  # INSERT новой строки
+            conn,
             "INSERT INTO consensus_targets(uid, ticker, company, recommendation, recommendationDate, currency, targetPrice, showName) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (uid, ticker, company, recommendation, recommendationDate, currency, targetPrice, showName)
+            (rec_obj.uid, rec_obj.ticker, rec_obj.company, rec_obj.recommendation, rec_obj.recommendationDate, rec_obj.currency, rec_obj.targetPrice, rec_obj.showName)
         )
-        if db_layer.BACKEND == 'sqlite':
-            conn.commit()
-    print(f"Прогноз {recommendation} от {company} по {ticker} за {recommendationDate} сохранен.")
-    return {"status": "inserted", "uid": uid, "recommendationDate": recommendationDate, "company": company}
+    print(f"Прогноз {rec_obj.recommendation} от {rec_obj.company} по {rec_obj.ticker} за {rec_obj.recommendationDate} сохранен.")
+    return {"status": "inserted", "uid": rec_obj.uid, "recommendationDate": rec_obj.recommendationDate, "company": rec_obj.company}
 
 
 # ----------------------------------------------------------------------------
@@ -295,9 +335,9 @@ def FillingConsensusData(limit: int | None = None, sleep_sec: float = 0.2) -> Di
       2. Сохранить консенсус (текущая дата recommendationDate).
       3. Сохранить каждый таргет аналитика с оригинальной recommendationDate из ответа.
     """
-    db_layer.init_schema()
-    with db_layer.get_connection() as conn:
-        cur = conn.execute("SELECT uid FROM perspective_shares ORDER BY uid")
+    db_layer.init_schema()  # Гарантируем наличие таблиц и индексов
+    with db_layer.get_connection() as conn:  # Получаем список всех перспективных uid
+        cur = db_layer.exec_sql(conn, "SELECT uid FROM perspective_shares ORDER BY uid")
         uids = [r[0] for r in cur.fetchall() if r[0]]
     if limit is not None:
         uids = uids[:limit]
@@ -310,10 +350,10 @@ def FillingConsensusData(limit: int | None = None, sleep_sec: float = 0.2) -> Di
     import time
     today_iso = datetime.now(UTC).date().isoformat()
     auth_failed = False
-    for uid in uids:
+    for uid in uids:  # Основной цикл по инструментам
         if auth_failed:
             break
-        data = GetConsensusByUid(uid)
+        data = GetConsensusByUid(uid)  # Запрос к API (кэшируется)
         if not data or (isinstance(data, dict) and data.get('status') == 'http_error'):
             not_found += 1
             processed += 1
@@ -323,24 +363,30 @@ def FillingConsensusData(limit: int | None = None, sleep_sec: float = 0.2) -> Di
             auth_failed = True
             print(f"Авторизация не удалась (code={data.get('code')}). Прекращаю обход.")
             break
+        # ---------------- Консенсус ----------------
         consensus_block = data.get('consensus') or {}
-        # Поля консенсуса
         c_uid = consensus_block.get('uid') or uid
         ticker = consensus_block.get('ticker')
         recommendation = consensus_block.get('recommendation')
         currency = consensus_block.get('currency')
-        consensus_val = consensus_block.get('consensus') or consensus_block.get('price_consensus') or consensus_block.get('priceConsensus')
+        consensus_val = (
+            consensus_block.get('consensus')
+            or consensus_block.get('price_consensus')
+            or consensus_block.get('priceConsensus')
+        )
         min_target = consensus_block.get('minTarget') or consensus_block.get('min_target')
         max_target = consensus_block.get('maxTarget') or consensus_block.get('max_target')
         if c_uid:
-            r_cons = AddConsensusForecasts(c_uid, ticker, recommendation, today_iso, currency, consensus_val, min_target, max_target)
+            r_cons = AddConsensusForecasts(
+                c_uid, ticker, recommendation, today_iso, currency, consensus_val, min_target, max_target
+            )
             if r_cons['status'] == 'inserted':
                 consensus_inserted += 1
             elif r_cons['status'] == 'dup':
                 consensus_dups += 1
-        # Таргеты
+        # ---------------- Таргеты ----------------
         targets_list = data.get('targets') or []
-        for t in targets_list:
+        for t in targets_list:  # Проходим по таргетам аналитиков
             t_uid = t.get('uid') or c_uid
             t_ticker = t.get('ticker') or ticker
             t_company = t.get('company')
@@ -349,7 +395,7 @@ def FillingConsensusData(limit: int | None = None, sleep_sec: float = 0.2) -> Di
             t_currency = t.get('currency')
             t_price = t.get('targetPrice') or t.get('target_price')
             t_show = t.get('showName') or t.get('show_name')
-            if t_uid and t_company and t_date:
+            if t_uid and t_company and t_date:  # Требуем минимальный набор для сохранения
                 r_t = AddConsensusTargets(t_uid, t_ticker, t_company, t_rec, t_date, t_currency, t_price, t_show)
                 if r_t['status'] == 'inserted':
                     targets_inserted += 1
